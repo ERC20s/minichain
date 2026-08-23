@@ -75,3 +75,47 @@ export function canonicalEncoding(tx: Transaction): Uint8Array {
   }
   return out
 }
+
+export type CanonicalBlockHeader = {
+  parentHash: string
+  height: number
+  timestamp: number
+  merkleRoot: string
+  // proposerPublicKey is raw bytes (Uint8Array) when present; absent means zero-length
+  proposerPublicKey?: Uint8Array
+}
+
+export function canonicalBlockEncoding(header: CanonicalBlockHeader): Uint8Array {
+  const parts: Uint8Array[] = []
+  parts.push(utf8Bytes("blk:"))
+
+  const pBytes = utf8Bytes(header.parentHash)
+  parts.push(u16be(pBytes.length))
+  parts.push(pBytes)
+
+  parts.push(u64be(header.height))
+  parts.push(u64be(header.timestamp))
+
+  const mBytes = utf8Bytes(header.merkleRoot)
+  parts.push(u16be(mBytes.length))
+  parts.push(mBytes)
+
+  if (typeof header.proposerPublicKey === "undefined" || header.proposerPublicKey === null) {
+    parts.push(u16be(0))
+  } else {
+    const pk = header.proposerPublicKey
+    parts.push(u16be(pk.length))
+    parts.push(pk)
+  }
+
+  // concatenate
+  let total = 0
+  for (const p of parts) total += p.length
+  const out = new Uint8Array(total)
+  let off = 0
+  for (const p of parts) {
+    out.set(p, off)
+    off += p.length
+  }
+  return out
+}

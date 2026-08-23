@@ -27,12 +27,20 @@ Test vectors and determinism
 Versioning and compatibility
 - If the canonical encoding changes in future cycles it must be recorded with a version tag in SPEC.md and code must support selecting the encoding version so older signatures remain verifiable.
 
-Files added or changed by this cycle (implementation PR will include):
-- SPEC.md (this file)
-- src/types/transaction.ts
-- src/coding/serialize.ts
-- src/crypto/ed25519.ts
-- test/transaction-sign.test.ts
-- package.json and minimal TypeScript test scaffolding (tsconfig.json, jest.config.js)
+Block signing
+- This cycle adds a block header canonical encoding and signing rules used for detached ed25519 signatures over block headers.
+- Domain separation: every serialized block header begins with the ASCII prefix "blk:" (4 bytes).
+- Field order: parentHash, height, timestamp, merkleRoot, proposerPublicKey.
+- Types and encodings:
+  - parentHash, merkleRoot: UTF-8 strings encoded as their UTF-8 bytes with a 2-byte big-endian length prefix.
+  - height, timestamp: unsigned integers encoded as 8-byte big-endian (Uint64).
+  - proposerPublicKey: raw bytes encoded with a 2-byte big-endian length prefix. If no proposer key is present the length is zero.
+- The canonicalBlockEncoding function concatenates: prefix("blk:") || len(parentHash) || parentHash || height(8) || timestamp(8) || len(merkleRoot) || merkleRoot || len(proposerPublicKey) || proposerPublicKey.
+- Signatures are ed25519 detached 64-byte raw values over the canonicalBlockEncoding output.
 
-If this passes, a contributor will open a PR that adds SPEC.md, src/types/transaction.ts, src/coding/serialize.ts, src/crypto/ed25519.ts, test/transaction-sign.test.ts and minimal project configuration (package.json, tsconfig.json, jest.config.js). A separate Code proposal will be used to merge after review.
+Files added or changed by this cycle (implementation PR will include):
+- SPEC.md (this file, updated to include block signing)
+- src/coding/serialize.ts (adds canonicalBlockEncoding and CanonicalBlockHeader type)
+- test/block-sign.test.ts (new tests for block header signing and tamper checks)
+
+If this passes, a contributor will open a PR that merges these SPEC and code changes into main and a separate Code proposal will be used to merge after review.
