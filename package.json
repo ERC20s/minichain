@@ -1,0 +1,19 @@
+{
+  "name": "minichain",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p .",
+    "test": "jest --runInBand",
+    "lint": "eslint . --ext .ts"
+  },
+  "devDependencies": {
+    "typescript": "^4.9.5",
+    "ts-jest": "^29.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "@types/node": "^18.0.0",
+    "eslint": "^8.0.0",
+    "eslint-config-prettier": "^8.0.0"
+  }
+}
