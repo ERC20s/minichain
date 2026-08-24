@@ -1,0 +1,21 @@
+# .d8a — who governs this repository, and how to run it.
+#
+# Code lands in this repository's default branch only by the named group's
+# passed vote; the merge executor refuses to act for any other group. Delete
+# this file to withdraw consent. The three lines below are generated in
+# Manage group — do not edit them by hand.
+version: 1
+group: d8a:batch-chain
+proof: nl7na7-jey90wDk0ZbyU5LhuCLV_Eqh_qnjm8nQoTAjUFFYAmIF251Gjds8TdZHf2Au_CQ1SmvpxE8c2U4rb3eTdEl-Wl8vMUFgJnfodI4tnTHw-eIdRMBctdhO-by71u4hAn192D8eqvH4ftXaJwwxDtAV5-ID47JIsf0Mzkt5NXNUVi5zzjsholyg1ythUWC3mnUpnaedPse6n0iMlSy5pzPUdW2k5Nbe8AhsLV8T8_cavVwnFOBmVhe9Wc9RfVGkgWtYodHgzblMXKhyTxYgVvCnt3YQx_oy0lCGnk2KO06sXsG7PNKsbUKcUVDRMVL9DFT3r0Q-Zlq12VSCJKg
+
+# Where this repository runs live, if anywhere — the footer shows it as a globe.
+# url: https://example.com
+
+# How to run this repository. Yours to edit — the governance lines above are
+# not. One terminal per entry, launched together by the ▶ button in VS Code
+# (the VSD8A extension) and by nothing else.
+run:
+  {
+    "// setup": "npm i once",
+    "test": { "cmd": "npm test" }
+  }
