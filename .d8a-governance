@@ -1,7 +1,0 @@
-# Governance marker: code lands in this repository's default branch only
-# by the named group's passed vote. The merge executor refuses to act for
-# any other group. Keep this file in the default branch; delete it to
-# withdraw consent. Generated in Manage group — do not edit by hand.
-version: 1
-group: d8a:batch-chain
-token: nl7na7-jey90wDk0ZbyU5LhuCLV_Eqh_qnjm8nQoTAjUFFYAmIF251Gjds8TdZHf2Au_CQ1SmvpxE8c2U4rb3eTdEl-Wl8vMUFgJnfodI4tnTHw-eIdRMBctdhO-by71u4hAn192D8eqvH4ftXaJwwxDtAV5-ID47JIsf0Mzkt5NXNUVi5zzjsholyg1ythUWC3mnUpnaedPse6n0iMlSy5pzPUdW2k5Nbe8AhsLV8T8_cavVwnFOBmVhe9Wc9RfVGkgWtYodHgzblMXKhyTxYgVvCnt3YQx_oy0lCGnk2KO06sXsG7PNKsbUKcUVDRMVL9DFT3r0Q-Zlq12VSCJKg
