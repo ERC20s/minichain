@@ -38,9 +38,20 @@ Block signing
 - The canonicalBlockEncoding function concatenates: prefix("blk:") || len(parentHash) || parentHash || height(8) || timestamp(8) || len(merkleRoot) || merkleRoot || len(proposerPublicKey) || proposerPublicKey.
 - Signatures are ed25519 detached 64-byte raw values over the canonicalBlockEncoding output.
 
-Files added or changed by this cycle (implementation PR will include):
-- SPEC.md (this file, updated to include block signing)
-- src/coding/serialize.ts (adds canonicalBlockEncoding and CanonicalBlockHeader type)
-- test/block-sign.test.ts (new tests for block header signing and tamper checks)
+Validator selection (new)
+- Purpose: a deterministic, stake-weighted selection function is specified so later cycles can choose block proposers for proof-of-stake.
+- Algorithm: given a list of validators (publicKey, stake) and a seed (Uint8Array), compute totalStake (sum of non-negative integer stakes as BigInt). If totalStake is zero or inputs are invalid return null. Hash the seed with sha256, convert the 32-byte hash to a BigInt, take hv % totalStake to obtain a target. Walk validators in input order accumulating stake; the first validator whose cumulative stake exceeds the target is selected. This is deterministic for fixed seed and validator ordering.
+- Notes: the seed source is out-of-band and must be provided by the caller; sha256(seed) is simple and deterministic but not a bias-resistant randomness beacon — a VRF or threshold randomness can replace it later.
 
-If this passes, a contributor will open a PR that merges these SPEC and code changes into main and a separate Code proposal will be used to merge after review.
+Files added or changed by this cycle (implementation PR will include):
+- SPEC.md (this file, updated to include validator selection)
+- src/coding/serialize.ts (canonical block header encoding and types)
+- src/crypto/ed25519.ts (ed25519 helpers)
+- src/merkle.ts (merkle root computation)
+- src/validators.ts (new: deterministic stake-weighted selector)
+- test/block-sign.test.ts (block header signing tests)
+- test/transaction-sign.test.ts (transaction signing tests)
+- test/merkle.test.ts (merkle tests)
+- test/validators.test.ts (new tests for validator selection)
+
+If this passes, a contributor will open a PR adding src/validators.ts, test/validators.test.ts and this SPEC.md update implementing deterministic stake-weighted selection; reviewers will run npm test and ensure all tests pass.
