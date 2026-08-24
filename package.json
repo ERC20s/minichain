@@ -12,6 +12,7 @@
     "typescript": "^5.2.2"
   },
   "dependencies": {
-    "tweetnacl": "^1.0.3"
+    "tweetnacl": "^1.0.3",
+    "ws": "^8.13.0"
   }
 }
