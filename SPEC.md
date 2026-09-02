@@ -38,13 +38,23 @@ Block signing
 - The canonicalBlockEncoding function concatenates: prefix("blk:") || len(parentHash) || parentHash || height(8) || timestamp(8) || len(merkleRoot) || merkleRoot || len(proposerPublicKey) || proposerPublicKey.
 - Signatures are ed25519 detached 64-byte raw values over the canonicalBlockEncoding output.
 
-Validator selection (new)
+Merkle leaves (new)
+- A block's merkleRoot is computed over the block's transactions with exactly one leaf encoding: leaf = sha256(canonicalEncoding(tx)), where canonicalEncoding is the transaction encoding specified above — the same bytes a transaction signature covers.
+- The leaf bytes are produced by blockMerkleRoot(transactions) in src/block.ts, which maps each transaction through canonicalEncoding and passes the resulting byte arrays to merkleRoot (src/merkle.ts, which hashes each leaf with sha256 and duplicates the last node on odd layers).
+- Both the proposer (createBlock) and the validator (the "blk" handler in src/node.ts) MUST use blockMerkleRoot. No other encoding — in particular JSON.stringify of the transaction object — may be used for leaves: JSON.stringify depends on key insertion order, omits fields whose value is undefined and can print large numbers in exponent form, so two honest nodes holding the same logical transaction would otherwise compute different roots and silently reject each other's valid blocks.
+- An empty transaction list gives the merkleRoot of no leaves, i.e. sha256 of the empty byte string in hex (see src/merkle.ts).
+- Compatibility: this replaces the earlier JSON leaf encoding. Any merkle root computed under the old encoding is invalidated; per the versioning rule above, a future change to the leaf encoding must be recorded here with a version tag.
+
+Validator selection
 - Purpose: a deterministic, stake-weighted selection function is specified so later cycles can choose block proposers for proof-of-stake.
 - Algorithm: given a list of validators (publicKey, stake) and a seed (Uint8Array), compute totalStake (sum of non-negative integer stakes as BigInt). If totalStake is zero or inputs are invalid return null. Hash the seed with sha256, convert the 32-byte hash to a BigInt, take hv % totalStake to obtain a target. Walk validators in input order accumulating stake; the first validator whose cumulative stake exceeds the target is selected. This is deterministic for fixed seed and validator ordering.
 - Notes: the seed source is out-of-band and must be provided by the caller; sha256(seed) is simple and deterministic but not a bias-resistant randomness beacon — a VRF or threshold randomness can replace it later.
 
 Files added or changed by this cycle (implementation PR will include):
-- SPEC.md (this file, updated to include validator selection)
+- SPEC.md (this file, updated to include canonical merkle leaves and validator selection)
+- src/block.ts (blockMerkleRoot: canonical leaf bytes shared by builder and validator)
+- src/node.ts (validation uses blockMerkleRoot instead of a duplicated JSON leaf loop)
+- test/block-merkle.test.ts (new: reordered keys, absent payload, tampering, gossip round-trip)
 - src/coding/serialize.ts (canonical block header encoding and types)
 - src/crypto/ed25519.ts (ed25519 helpers)
 - src/merkle.ts (merkle root computation)
