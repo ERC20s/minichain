@@ -23,6 +23,21 @@ export type GossipNode = {
   close: () => void
 }
 
+// defensive limits
+const ALLOWED_TYPES = new Set(["tx", "blk"])
+const MAX_PAYLOAD_HEX = 131072 // max chars in hex (64 KiB bytes)
+const MAX_SIG_HEX = 1024
+const MAX_PUBKEY_HEX = 1024
+const HEX_RE = /^[0-9a-fA-F]*$/
+
+function validHexString(s: any, maxLen: number): s is string {
+  if (typeof s !== "string") return false
+  if (s.length % 2 !== 0) return false
+  if (s.length > maxLen) return false
+  if (!HEX_RE.test(s)) return false
+  return true
+}
+
 export function startGossipNode(port: number, peers: string[]): GossipNode {
   const server = new WebSocketServer({ port })
   const sockets: Set<WebSocket> = new Set()
@@ -33,19 +48,28 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     for (const cb of cbs) cb(obj)
   }
 
+  function handleIncomingMessage(data: WebSocket.Data) {
+    try {
+      const s = typeof data === "string" ? data : data.toString()
+      const env = JSON.parse(s) as MsgEnvelope
+      // validate envelope before decoding hex
+      if (!ALLOWED_TYPES.has(env.type)) return
+      if (!validHexString(env.payloadHex, MAX_PAYLOAD_HEX)) return
+      if (env.sigHex !== undefined && !validHexString(env.sigHex, MAX_SIG_HEX)) return
+      if (env.pubKeyHex !== undefined && !validHexString(env.pubKeyHex, MAX_PUBKEY_HEX)) return
+      const payload = fromHex(env.payloadHex)
+      const sig = env.sigHex ? fromHex(env.sigHex) : undefined
+      const pubKey = env.pubKeyHex ? fromHex(env.pubKeyHex) : undefined
+      emit(env.type, { payload, sig, pubKey, raw: env })
+    } catch (e) {
+      // ignore parse errors and invalid envelopes
+    }
+  }
+
   server.on("connection", (ws: WebSocket) => {
     sockets.add(ws)
     ws.on("message", (data: WebSocket.Data) => {
-      try {
-        const s = typeof data === "string" ? data : data.toString()
-        const env = JSON.parse(s) as MsgEnvelope
-        const payload = fromHex(env.payloadHex)
-        const sig = env.sigHex ? fromHex(env.sigHex) : undefined
-        const pubKey = env.pubKeyHex ? fromHex(env.pubKeyHex) : undefined
-        emit(env.type, { payload, sig, pubKey, raw: env })
-      } catch (e) {
-        // ignore
-      }
+      handleIncomingMessage(data)
     })
     ws.on("close", () => sockets.delete(ws))
     ws.on("error", () => sockets.delete(ws))
@@ -60,16 +84,7 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
         clients.add(c)
       })
       c.on("message", (data: WebSocket.Data) => {
-        try {
-          const s = typeof data === "string" ? data : data.toString()
-          const env = JSON.parse(s) as MsgEnvelope
-          const payload = fromHex(env.payloadHex)
-          const sig = env.sigHex ? fromHex(env.sigHex) : undefined
-          const pubKey = env.pubKeyHex ? fromHex(env.pubKeyHex) : undefined
-          emit(env.type, { payload, sig, pubKey, raw: env })
-        } catch (e) {
-          // ignore
-        }
+        handleIncomingMessage(data)
       })
       c.on("close", () => clients.delete(c))
       c.on("error", () => clients.delete(c))
