@@ -43,12 +43,26 @@ Validator selection (new)
 - Algorithm: given a list of validators (publicKey, stake) and a seed (Uint8Array), compute totalStake (sum of non-negative integer stakes as BigInt). If totalStake is zero or inputs are invalid return null. Hash the seed with sha256, convert the 32-byte hash to a BigInt, take hv % totalStake to obtain a target. Walk validators in input order accumulating stake; the first validator whose cumulative stake exceeds the target is selected. This is deterministic for fixed seed and validator ordering.
 - Notes: the seed source is out-of-band and must be provided by the caller; sha256(seed) is simple and deterministic but not a bias-resistant randomness beacon — a VRF or threshold randomness can replace it later.
 
+Proposer eligibility (new)
+- Purpose: block acceptance in src/node.ts is now conditional on stake-weighted proposer selection, so the deterministic selector in src/validators.ts actually governs who may extend the chain. Before this cycle any self-consistent keypair could extend the chain.
+- Configuration: Node takes an optional fourth constructor argument, `validators?: Validator[]`. An empty or omitted set means open membership and the pre-existing behaviour (signature check only) is unchanged, which keeps test/node-sync.test.ts valid.
+- Key encoding: Validator.publicKey is the LOWERCASE hex of the raw 32-byte ed25519 public key. Nodes, tests and fixtures produce it with publicKeyToHex(key) exported from src/validators.ts; the helper also lowercases a string input so a set written by hand cannot disagree about case.
+- Seed derivation: the seed for height H is the UTF-8 bytes of `parentHash + ":" + height`, i.e. Node.proposerSeed(blk). It is derivable by every node from data it already has and requires no extra gossip message.
+- Rejection rules, applied after height linkage, Merkle root recomputation and ed25519 signature verification, and only when a validator set is configured:
+  - selectValidator(validators, seed) returns null (empty set, zero total stake, invalid stake) — the block is rejected.
+  - the selected publicKey does not equal publicKeyToHex(m.pubKey) — the block is rejected, even though its signature is valid.
+  A rejected block is not stored and not re-broadcast.
+- Ordering: selectValidator walks the validator array in input order, so every node must hold the validator list in the same order or nodes will disagree about who is eligible. Validator-set distribution and rotation are out of scope for this cycle.
+- Known limits: one eligible proposer per height means the chain stalls at that height if the selected validator is offline — slots, timeouts or a fallback proposer are a later cycle. The seed is derived from block data and is grindable in principle; as already noted under Validator selection, sha256(seed) is not a bias-resistant randomness beacon and a VRF can replace it later.
+
 Files added or changed by this cycle (implementation PR will include):
 - SPEC.md (this file, updated to include validator selection)
 - src/coding/serialize.ts (canonical block header encoding and types)
 - src/crypto/ed25519.ts (ed25519 helpers)
 - src/merkle.ts (merkle root computation)
-- src/validators.ts (new: deterministic stake-weighted selector)
+- src/validators.ts (deterministic stake-weighted selector; publicKeyToHex helper)
+- src/node.ts (optional validator set; proposer eligibility check before accepting a gossiped block)
+- test/node-proposer.test.ts (new: eligible proposer accepted, ineligible signer rejected, open membership unchanged)
 - test/block-sign.test.ts (block header signing tests)
 - test/transaction-sign.test.ts (transaction signing tests)
 - test/merkle.test.ts (merkle tests)
