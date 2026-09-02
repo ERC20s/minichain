@@ -16,6 +16,15 @@ Canonical serialization
   - payload: optional arbitrary JSON object. If present it is JSON-serialized with a stable key ordering (object keys sorted lexicographically) and encoded as UTF-8 with a 2-byte big-endian length prefix. If absent, the length is zero.
 - The canonicalEncoding function concatenates: prefix("tx:") || len(sender) || sender || len(recipient) || recipient || amount(8) || nonce(8) || len(payload) || payloadBytes.
 
+Input validation (canonical encoders reject what they cannot represent)
+- Principle: the canonical encoders produce the bytes a signature is made over, so they must be injective. An input the format cannot represent is REJECTED with a CanonicalEncodingError (a RangeError subclass exported from src/coding/serialize.ts); it is never truncated, rounded or stringified.
+- uint64 fields (tx.amount, tx.nonce, header.height, header.timestamp): must be a number, finite, an integer, >= 0 and <= Number.MAX_SAFE_INTEGER (2**53 - 1). This closes two collisions in the old encoder: amount 1 and amount 1.5 produced identical bytes, and a negative amount encoded as 0xffffffffffffffff, indistinguishable from the maximum uint64. The nominal uint64 range is narrowed to 2**53 - 1 because that is the largest integer a JavaScript number holds exactly; a wider range would need bigint fields and a version tag.
+- Length-prefixed fields (sender, recipient, payload, parentHash, merkleRoot, proposerPublicKey): the 2-byte big-endian prefix carries at most 65535 bytes, measured in UTF-8 BYTES, not characters. A longer field throws instead of writing the length modulo 65536 while emitting the full bytes, which would have made the framing non-injective.
+- String fields (tx.sender, tx.recipient, header.parentHash, header.merkleRoot): must be strings. A missing field previously encoded as the literal text "undefined", so a transaction with no sender signed as one whose sender was "undefined".
+- header.proposerPublicKey: absent or null encodes as a zero length; when present it must be a Uint8Array (raw bytes, never a hex string).
+- Stable JSON (payload): object keys are sorted as before, and values JSON cannot round-trip are rejected — undefined, NaN, Infinity, -Infinity, functions, symbols and bigints all throw, with the path of the offending value in the message.
+- Compatibility: the bytes produced for VALID inputs are unchanged, so existing signatures and test vectors still verify and no encoding version tag is introduced. Callers that encode untrusted input must handle the throw; the gossip "blk" handler in src/node.ts already runs inside a try/catch, so a malformed remote block is ignored rather than accepted.
+
 Signing and signature format
 - ed25519 (RFC 8032) detached signatures are used.
 - Signatures are raw 64-byte binary values. Tests in the repository use Uint8Array values and compare them byte-for-byte. When serialized for storage or transport the signature may be hex or base64 encoded; the code in this cycle returns and accepts raw Uint8Array values.
@@ -54,5 +63,6 @@ Files added or changed by this cycle (implementation PR will include):
 - test/transaction-sign.test.ts (transaction signing tests)
 - test/merkle.test.ts (merkle tests)
 - test/validators.test.ts (new tests for validator selection)
+- test/canonical-validation.test.ts (new: the encoders reject fractional, negative and over-range integers, over-long length-prefixed fields, missing or mistyped string fields and non-round-trippable payload values, while the byte vectors for valid inputs stay identical)
 
 If this passes, a contributor will open a PR adding src/validators.ts, test/validators.test.ts and this SPEC.md update implementing deterministic stake-weighted selection; reviewers will run npm test and ensure all tests pass.
