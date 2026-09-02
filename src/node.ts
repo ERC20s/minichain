@@ -1,9 +1,7 @@
 import { startGossipNode, GossipNode } from "./gossip/ws"
-import { Block, createBlock } from "./block"
-import { merkleRoot } from "./merkle"
+import { Block, blockMerkleRoot } from "./block"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
-import { Transaction } from "./types/transaction"
 
 export class Node {
   gossip: GossipNode
@@ -23,11 +21,9 @@ export class Node {
         if (typeof blk.height !== "number" || blk.height !== this.tip.height + 1) return
         if (typeof blk.parentHash !== "string" || blk.parentHash !== this.tip.merkleRoot) return
 
-        // recompute merkle root from transactions
-        const txBytes: Uint8Array[] = (blk.transactions || []).map((tx: Transaction) => {
-          return new TextEncoder().encode(JSON.stringify(tx))
-        })
-        const mr = merkleRoot(txBytes)
+        // recompute merkle root from transactions, using the same canonical
+        // leaf bytes the proposer used (see blockMerkleRoot in src/block.ts)
+        const mr = blockMerkleRoot(blk.transactions || [])
         if (mr !== blk.merkleRoot) return
 
         // require signature and pubKey
