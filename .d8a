@@ -124,11 +124,15 @@ payments:
 # Where this repository runs live, if anywhere — the footer shows it as a globe.
 # url: https://example.com
 
+keys:
+  PORT
+  PEERS
+
 # How to run this repository. Yours to edit — the governance lines above are
 # not. One terminal per entry, launched together by the ▶ button in VS Code
 # (the VSD8A extension) and by nothing else.
 run:
   {
-    "// setup": "npm i once",
+    "dev": { "cmd": "npm run dev", "port": 9300 },
     "test": { "cmd": "npm test" }
   }
