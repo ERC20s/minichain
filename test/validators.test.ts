@@ -51,4 +51,65 @@ describe("validator selection", () => {
     expect(["a", "b", "c"]).toContain(p2 as string)
     expect(["a", "b", "c"]).toContain(p3 as string)
   })
+
+  it("is independent of the order the validators are handed in", () => {
+    const vals: Validator[] = [
+      { publicKey: "a", stake: 10 },
+      { publicKey: "b", stake: 20 },
+      { publicKey: "c", stake: 30 },
+      { publicKey: "d", stake: 7 },
+      { publicKey: "e", stake: 1 },
+    ]
+    const rotations: Validator[][] = []
+    for (let i = 0; i < vals.length; i++) {
+      rotations.push(vals.slice(i).concat(vals.slice(0, i)))
+    }
+    rotations.push([...vals].reverse())
+    rotations.push([vals[3], vals[0], vals[4], vals[2], vals[1]])
+
+    for (let n = 0; n < 20; n++) {
+      const s = seedFrom(n)
+      const expected = selectValidator(vals, s)
+      expect(expected).not.toBeNull()
+      for (const shuffled of rotations) {
+        expect(selectValidator(shuffled, s)).toBe(expected)
+      }
+    }
+  })
+
+  it("sums duplicate publicKeys instead of counting them twice", () => {
+    const split: Validator[] = [
+      { publicKey: "a", stake: 5 },
+      { publicKey: "b", stake: 30 },
+      { publicKey: "a", stake: 5 },
+    ]
+    const merged: Validator[] = [
+      { publicKey: "a", stake: 10 },
+      { publicKey: "b", stake: 30 },
+    ]
+    for (let n = 0; n < 20; n++) {
+      const s = seedFrom(n)
+      expect(selectValidator(split, s)).toBe(selectValidator(merged, s))
+    }
+  })
+
+  it("never selects a zero-stake validator", () => {
+    const vals: Validator[] = [
+      { publicKey: "zero-1", stake: 0 },
+      { publicKey: "staked", stake: 4 },
+      { publicKey: "zero-2", stake: 0 },
+    ]
+    for (let n = 0; n < 20; n++) {
+      expect(selectValidator(vals, seedFrom(n))).toBe("staked")
+    }
+    // a set whose stakes are all zero has no proposer at all
+    expect(
+      selectValidator([{ publicKey: "zero-1", stake: 0 }, { publicKey: "zero-2", stake: 0 }], seedFrom(3))
+    ).toBeNull()
+  })
+
+  it("rejects a validator whose publicKey is not a string", () => {
+    // @ts-ignore
+    expect(selectValidator([{ publicKey: 7, stake: 1 }], seedFrom(1))).toBeNull()
+  })
 })
