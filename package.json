@@ -3,13 +3,15 @@
   "version": "0.0.0",
   "private": true,
   "scripts": {
-    "test": "jest"
+    "test": "jest",
+    "dev": "ts-node examples/run-node.ts"
   },
   "devDependencies": {
     "@types/jest": "^29.5.3",
     "jest": "^29.6.1",
     "ts-jest": "^29.1.0",
-    "typescript": "^5.2.2"
+    "typescript": "^5.2.2",
+    "ts-node": "^10.9.1"
   },
   "dependencies": {
     "tweetnacl": "^1.0.3",
