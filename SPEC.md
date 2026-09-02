@@ -38,6 +38,15 @@ Block signing
 - The canonicalBlockEncoding function concatenates: prefix("blk:") || len(parentHash) || parentHash || height(8) || timestamp(8) || len(merkleRoot) || merkleRoot || len(proposerPublicKey) || proposerPublicKey.
 - Signatures are ed25519 detached 64-byte raw values over the canonicalBlockEncoding output.
 
+Merkle tree (version 2)
+- Purpose: the Merkle root in a block header must commit to exactly one transaction list. Version 1 (sha256 of raw bytes at every level, last node duplicated on an odd layer) was not injective: merkleRoot([a,b,c]) and merkleRoot([a,b,c,c]) produced the same value (the CVE-2012-2459 shape), so a signed header could be replayed with a different transaction list.
+- Domain separation: a leaf is hashed as sha256(0x00 || txBytes) and an internal node as sha256(0x01 || left || right). Because the tag byte differs, a 64-byte "transaction" can never collide with an internal node preimage (second-preimage on the tree).
+- Odd layers: when a layer has an odd number of nodes the lone last node is PROMOTED unchanged into the next layer. It is never paired with itself. This makes the tree shape a function of the leaf count, so distinct transaction lists have distinct roots.
+- Empty list: merkleRoot([]) is sha256(0x00), i.e. the leaf tag over an empty transaction.
+- Worked example, leaves ha=H(0x00||a), hb, hc: merkleRoot([a,b,c]) = H(0x01 || H(0x01||ha||hb) || hc), while merkleRoot([a,b,c,c]) = H(0x01 || H(0x01||ha||hb) || H(0x01||hc||hc)). The two differ.
+- Versioning: this is Merkle version 2 and it changes every root value. Blocks and block-header signatures produced under version 1 do not verify against version 2 code. There is no live chain to migrate; if one exists later, a version tag must select the construction, as the Versioning and compatibility section requires.
+- Callers (src/block.ts createBlock, the "blk" handler in src/node.ts) are unchanged: they call merkleRoot and get the new construction automatically.
+
 Validator selection (new)
 - Purpose: a deterministic, stake-weighted selection function is specified so later cycles can choose block proposers for proof-of-stake.
 - Algorithm: given a list of validators (publicKey, stake) and a seed (Uint8Array), compute totalStake (sum of non-negative integer stakes as BigInt). If totalStake is zero or inputs are invalid return null. Hash the seed with sha256, convert the 32-byte hash to a BigInt, take hv % totalStake to obtain a target. Walk validators in input order accumulating stake; the first validator whose cumulative stake exceeds the target is selected. This is deterministic for fixed seed and validator ordering.
