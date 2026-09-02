@@ -76,4 +76,38 @@ describe("gossip websocket transport", () => {
 
     expect(got).toBe(true)
   }, 1000)
+
+  it("ignores an oversized payloadHex without crashing", async () => {
+    const portA = 9301
+    const portB = 9302
+    const urlA = `ws://127.0.0.1:${portA}`
+    const urlB = `ws://127.0.0.1:${portB}`
+
+    const nodeA = startGossipNode(portA, [urlB])
+    const nodeB = startGossipNode(portB, [urlA])
+
+    let received = false
+    nodeB.on("tx", (m) => {
+      received = true
+    })
+
+    await wait(50)
+
+    // craft an oversized payloadHex (one more than MAX_PAYLOAD_HEX)
+    const oversized = "f".repeat(131073)
+    const env = JSON.stringify({ type: "tx", payloadHex: oversized })
+
+    // send directly to server socket set (connect and send)
+    const ws = new (require("ws"))(urlA)
+    await new Promise((res) => ws.on("open", res))
+    ws.send(env)
+
+    await wait(200)
+
+    ws.close()
+    nodeA.close()
+    nodeB.close()
+
+    expect(received).toBe(false)
+  }, 1000)
 })
