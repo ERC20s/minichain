@@ -38,6 +38,14 @@ Block signing
 - The canonicalBlockEncoding function concatenates: prefix("blk:") || len(parentHash) || parentHash || height(8) || timestamp(8) || len(merkleRoot) || merkleRoot || len(proposerPublicKey) || proposerPublicKey.
 - Signatures are ed25519 detached 64-byte raw values over the canonicalBlockEncoding output.
 
+Block hash and chain linkage (blockHash v1, new)
+- Purpose: blocks need an identity of their own. Before this cycle a child block linked to its parent by the parent's transaction merkleRoot, which commits only to the transaction list — every empty block hashes to sha256("") — so two different headers with the same transactions were indistinguishable and distinct histories could collide.
+- Definition: blockHash(block) = hex-encoded sha256(canonicalBlockEncoding({parentHash, height, timestamp, merkleRoot})), where the proposerPublicKey field of the canonical block encoding is absent and therefore encoded as a zero-length field.
+- The proposer public key and the block signature are deliberately NOT committed to by blockHash v1, so any peer can compute a block's hash from the block alone, without the gossip envelope. The trade-off: the same header signed by two different proposers has the same block hash. If a future cycle needs proposer-bound identity it must be recorded as blockHash v2 with a version tag, as required by the versioning rule above.
+- Linkage rule: a block is a valid child of the tip when height == tip.height + 1 and parentHash == blockHash(tip). Nodes keep tipHash alongside tip; it is initialised to blockHash(genesis) and updated to blockHash(block) on every accepted block. Linking against merkleRoot is no longer valid and is rejected.
+- Block signing is unchanged: the signature is still an ed25519 detached signature over canonicalBlockEncoding of the full header including proposerPublicKey.
+- Implemented in src/block.ts (blockHash, BlockHashInput) and src/node.ts (tipHash and the linkage check); covered by test/block-hash.test.ts and test/node-sync.test.ts.
+
 Validator selection (new)
 - Purpose: a deterministic, stake-weighted selection function is specified so later cycles can choose block proposers for proof-of-stake.
 - Algorithm: given a list of validators (publicKey, stake) and a seed (Uint8Array), compute totalStake (sum of non-negative integer stakes as BigInt). If totalStake is zero or inputs are invalid return null. Hash the seed with sha256, convert the 32-byte hash to a BigInt, take hv % totalStake to obtain a target. Walk validators in input order accumulating stake; the first validator whose cumulative stake exceeds the target is selected. This is deterministic for fixed seed and validator ordering.

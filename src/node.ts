@@ -1,5 +1,5 @@
 import { startGossipNode, GossipNode } from "./gossip/ws"
-import { Block, createBlock } from "./block"
+import { Block, blockHash } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
@@ -8,10 +8,13 @@ import { Transaction } from "./types/transaction"
 export class Node {
   gossip: GossipNode
   tip: Block
+  // identity of the current tip: children must name this in parentHash
+  tipHash: string
 
   constructor(port: number, peers: string[], genesis: Block) {
     this.gossip = startGossipNode(port, peers)
     this.tip = genesis
+    this.tipHash = blockHash(genesis)
 
     this.gossip.on("blk", (m) => {
       try {
@@ -21,7 +24,8 @@ export class Node {
 
         // basic linkage: must be exactly tip.height + 1
         if (typeof blk.height !== "number" || blk.height !== this.tip.height + 1) return
-        if (typeof blk.parentHash !== "string" || blk.parentHash !== this.tip.merkleRoot) return
+        // and must name the tip by its block hash (not by the tip's merkle root)
+        if (typeof blk.parentHash !== "string" || blk.parentHash !== this.tipHash) return
 
         // recompute merkle root from transactions
         const txBytes: Uint8Array[] = (blk.transactions || []).map((tx: Transaction) => {
@@ -46,6 +50,7 @@ export class Node {
 
         // accept block
         this.tip = blk
+        this.tipHash = blockHash(blk)
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
