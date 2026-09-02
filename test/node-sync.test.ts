@@ -1,6 +1,6 @@
 import { Node } from "../src/node"
 import { keypairFromSeed, sign } from "../src/crypto/ed25519"
-import { createBlock } from "../src/block"
+import { blockHash, createBlock } from "../src/block"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -21,7 +21,7 @@ describe("in-memory Node syncing over gossip", () => {
     const kp = keypairFromSeed(seed)
 
     // create a new block building on genesis
-    const blk = createBlock(genesis.merkleRoot, 1, [{ sender: "alice", recipient: "bob", amount: 1, nonce: 1 }])
+    const blk = createBlock(blockHash(genesis), 1, [{ sender: "alice", recipient: "bob", amount: 1, nonce: 1 }])
 
     // sign canonical header
     const header = {
@@ -51,5 +51,8 @@ describe("in-memory Node syncing over gossip", () => {
     expect(nodeA.tip.height).toBe(1)
     expect(nodeB.tip.height).toBe(1)
     expect(nodeA.tip.merkleRoot).toEqual(nodeB.tip.merkleRoot)
+    // both nodes agree on block identity, and it is the accepted block's hash
+    expect(nodeA.tipHash).toEqual(nodeB.tipHash)
+    expect(nodeA.tipHash).toEqual(blockHash(blk))
   }, 2000)
 })
