@@ -1,5 +1,6 @@
-import { blockHash, createBlock } from "../src/block"
-import { Keypair, keypairFromSeed } from "../src/crypto/ed25519"
+import { Block, blockHash, createBlock } from "../src/block"
+import { canonicalBlockEncoding } from "../src/coding/serialize"
+import { Keypair, keypairFromSeed, sign } from "../src/crypto/ed25519"
 import { MAX_BLOCK_TRANSACTIONS, Node } from "../src/node"
 import { transactionId } from "../src/state/mempool"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
@@ -26,6 +27,17 @@ import { accountHex, funded, signedTx } from "./helpers/signed-tx"
  */
 function wait(ms: number) {
   return new Promise((res) => setTimeout(res, ms))
+}
+
+function signBlock(blk: Block, keypair: Keypair): Uint8Array {
+  const msg = canonicalBlockEncoding({
+    parentHash: blk.parentHash,
+    height: blk.height,
+    timestamp: blk.timestamp,
+    merkleRoot: blk.merkleRoot,
+    proposerPublicKey: keypair.publicKey,
+  })
+  return sign(msg, keypair.secretKey)
 }
 
 function kp(seedByte: number): Keypair {
@@ -219,4 +231,143 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       await wait(20)
     }
   }, 15000)
+})
+
+/**
+ * Liveness: one pending transaction that would not stage must not stop this node
+ * minting (src/state/mempool.ts, Mempool.selectForBlock).
+ *
+ * A block is judged all-or-nothing — BalanceLedger.stage and NonceLedger.stage
+ * answer null for the WHOLE list on the first transaction that cannot be applied
+ * — so a proposer that handed its raw pool to createBlock lost the entire block
+ * to one bad entry, at every tick, for ever. The pool could not heal itself
+ * either: drop() only removes what a block committed plus entries whose nonce is
+ * no longer above their sender's committed nonce, never one that has become
+ * UNAFFORDABLE while its nonce is still fresh.
+ *
+ * The poisoned state below is not contrived: it is what a sender that gossips
+ * nonce 1 to one node and nonce 2 to another produces the moment the first node
+ * mints. What is pinned here:
+ *
+ *  - take() still answers with the poisoned entry (the unfiltered accessor), and
+ *    selectForBlock() does not;
+ *  - a fresh transfer from another funded account still mints;
+ *  - a skipped entry STAYS pending, and lands as soon as it can be paid for —
+ *    including in the same block that credits its sender.
+ *
+ * The gossip ports used below (9177-9178) are in this file's range.
+ */
+describe("Node.proposeBlock skips a pending transaction that cannot stage", () => {
+  const alice = kp(11)
+  const bob = kp(22)
+
+  const validators: Validator[] = [
+    { publicKey: publicKeyToHex(alice.publicKey), stake: 60 },
+    { publicKey: publicKeyToHex(bob.publicKey), stake: 40 },
+  ]
+
+  const genesis = createBlock("0x00", 0, [])
+
+  /** Whoever the stake election names for this tip. */
+  const electedFor = (tip: Block): Keypair =>
+    publicKeyToHex(alice.publicKey) === selectValidator(validators, proposerSeed(tip)) ? alice : bob
+
+  // 83 can afford exactly one transfer; 84 is the ordinary funded account.
+  const poor = accountHex(83)
+  const rich = accountHex(84)
+  const opening = { ...funded([83], 100), ...funded([84]) }
+
+  /**
+   * Leave the node holding a pending transfer its sender can no longer pay for,
+   * by the route gossip actually produces: nonce 2 is pooled while the money is
+   * still there, then a block spending the whole balance at nonce 1 arrives.
+   */
+  function poison(node: Node) {
+    const pending = signedTx(83, { recipient: rich, amount: 100, nonce: 2 })
+    expect(node.submitTransaction(pending).admitted).toBe(true)
+
+    const spent = signedTx(83, { recipient: rich, amount: 100, nonce: 1 })
+    const stamp = Math.max(genesis.timestamp, Date.now())
+    const blk = createBlock(blockHash(genesis), 1, [spent], stamp)
+    const proposer = electedFor(genesis)
+    expect(node.acceptBlock(blk, signBlock(blk, proposer), proposer.publicKey)).toBe(true)
+
+    // drop() removes nothing here: nonce 2 is still strictly above the
+    // committed nonce 1, and the sender is now broke.
+    expect(node.tip.height).toBe(1)
+    expect(node.balances.balanceOf(poor)).toBe(0)
+    expect(node.nonces.lastNonce(poor)).toBe(1)
+    expect(node.mempool.has(transactionId(pending))).toBe(true)
+    expect(node.mempool.size).toBe(1)
+    return pending
+  }
+
+  it("mints past a pending transfer its sender can no longer afford", async () => {
+    const node = new Node(9177, [], genesis, validators, opening)
+    try {
+      const stuck = poison(node)
+
+      // the raw accessor still hands the poisoned entry over — that was the bug
+      expect(node.mempool.take(10).length).toBe(1)
+      // the selection used by a proposer refuses it
+      expect(node.mempool.selectForBlock(10)).toEqual([])
+      // ...so a pool holding ONLY it mints nothing, and no bad block goes out
+      expect(node.proposeBlock(electedFor(node.tip).secretKey, electedFor(node.tip).publicKey))
+        .toBeNull()
+
+      const fresh = signedTx(84, { recipient: "carol", amount: 5, nonce: 1 })
+      expect(node.submitTransaction(fresh).admitted).toBe(true)
+
+      const proposer = electedFor(node.tip)
+      const blk = node.proposeBlock(proposer.secretKey, proposer.publicKey)
+
+      expect(blk).not.toBeNull()
+      expect(blk!.height).toBe(2)
+      expect(blk!.transactions.length).toBe(1)
+      expect(blk!.transactions[0].sender).toBe(rich)
+      expect(node.tip.height).toBe(2)
+      expect(blockHash(node.tip)).toBe(blockHash(blk!))
+      expect(node.balances.balanceOf(rich)).toBe(1000000 + 100 - 5)
+
+      // skipping is not dropping: the entry is still pending
+      expect(node.mempool.size).toBe(1)
+      expect(node.mempool.has(transactionId(stuck))).toBe(true)
+    } finally {
+      node.close()
+      await wait(20)
+    }
+  }, 8000)
+
+  it("includes a skipped entry in the same block that credits its sender", async () => {
+    const node = new Node(9178, [], genesis, validators, opening)
+    try {
+      const stuck = poison(node)
+
+      // 84 pays 83 exactly what 83 still owes: the running balance the selection
+      // carries must see that credit and let the stuck transfer through.
+      const credit = signedTx(84, { recipient: poor, amount: 100, nonce: 1 })
+      expect(node.submitTransaction(credit).admitted).toBe(true)
+
+      const proposer = electedFor(node.tip)
+      const blk = node.proposeBlock(proposer.secretKey, proposer.publicKey)
+
+      expect(blk).not.toBeNull()
+      expect(blk!.transactions.length).toBe(2)
+      // the credit is ordered first — ascending nonce is what staging needs
+      expect(blk!.transactions[0].sender).toBe(rich)
+      expect(blk!.transactions[1].sender).toBe(poor)
+
+      expect(node.tip.height).toBe(2)
+      expect(node.nonces.lastNonce(poor)).toBe(2)
+      expect(node.nonces.lastNonce(rich)).toBe(1)
+      expect(node.balances.balanceOf(poor)).toBe(0)
+      expect(node.balances.balanceOf(rich)).toBe(1000000 + 100)
+      // both landed, so the pool is empty again
+      expect(node.mempool.has(transactionId(stuck))).toBe(false)
+      expect(node.mempool.size).toBe(0)
+    } finally {
+      node.close()
+      await wait(20)
+    }
+  }, 8000)
 })

@@ -51,9 +51,16 @@ publicKey)` on a timer. One tick:
 - refuses immediately unless this key is the stake-elected proposer for the
   current tip (`selectValidator(validators, proposerSeed(tip))`), when a
   validator set is configured;
-- takes up to 256 pending transactions from the mempool, in nonce order;
-- mints nothing at all when the pool is empty (pass `{ allowEmpty: true }` to
-  override), so an idle chain does not fill with empty blocks;
+- selects up to 256 pending transactions from the mempool, in nonce order,
+  SKIPPING any that would not stage against the current nonce and balance
+  ledgers (`Mempool.selectForBlock`). A block is judged all-or-nothing, so
+  without that skip one pending transfer its sender can no longer pay for —
+  which a sender that gossips two transactions to two nodes routinely
+  produces — would stop this node minting anything, at every tick, for ever.
+  A skipped transaction stays pending and can land at a later height, or in
+  the same block once an earlier transaction credits its sender;
+- mints nothing at all when the selection is empty (pass `{ allowEmpty: true }`
+  to override), so an idle chain does not fill with empty blocks;
 - stamps the block with `max(this node's clock, the parent's timestamp)`;
 - signs the header and puts the block through `Node.acceptBlock` — the same and
   only acceptance path a gossiped block takes — and gossips it only if this node

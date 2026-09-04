@@ -298,6 +298,10 @@ export class Mempool {
    *
    * Nothing is removed — a transaction leaves the pool only when a block
    * committing it is accepted (see drop()).
+   *
+   * This is the UNFILTERED view: it answers with whatever is pending, including
+   * an entry that would no longer stage. A proposer must use selectForBlock()
+   * instead, or one such entry kills every block it builds.
    */
   take(n: number): Transaction[] {
     if (!Number.isFinite(n) || n <= 0) return []
@@ -305,6 +309,102 @@ export class Mempool {
       .sort((a, b) => a.nonce - b.nonce || a.sequence - b.sequence)
       .slice(0, Math.floor(n))
       .map((entry) => entry.tx)
+  }
+
+  /**
+   * The transactions a proposer should actually put in the next block: the same
+   * order take() uses, but SKIPPING every entry that would not stage.
+   *
+   * Why this exists. A block is judged all-or-nothing: NonceLedger.stage and
+   * BalanceLedger.stage answer null for the WHOLE list on the first transaction
+   * that cannot be applied, and src/node.ts drops the block. So a proposer that
+   * hands its whole pool to createBlock loses the entire block to one bad entry
+   * — every tick, for ever, silently. And the pool cannot heal itself: drop()
+   * only removes what a block committed plus entries whose nonce is no longer
+   * strictly above their sender's committed nonce, never an entry that has
+   * become UNAFFORDABLE while its nonce is still fresh.
+   *
+   * That state is reachable in ordinary operation. A sender gossips nonce 1 to
+   * one node and nonce 2 to another while a link is down; the first node mints
+   * nonce 1; the second accepts that block, drops nothing (2 > 1) and is left
+   * holding a transfer its sender can no longer pay for. Its proposer loop then
+   * mints nothing for ever, without an error to show for it.
+   *
+   * The rule here, in one line:
+   *
+   *   walk the pending entries in block order on a working copy of the nonce and
+   *   balance state, take the ones that apply, and SKIP — never fail on — the
+   *   ones that do not.
+   *
+   * The simulation mirrors the two ledgers exactly, because a block built from a
+   * selection they would refuse is no better than the one this method replaces:
+   *
+   *  - NonceLedger.stage — a sender's nonce must be strictly above both its
+   *    committed nonce and any nonce already selected for it in this block;
+   *  - BalanceLedger.stage — debit the sender from its running balance, then
+   *    credit the recipient (so a self-transfer is still a no-op the sender must
+   *    afford), refusing a credit that would pass MAX_SAFE_INTEGER;
+   *  - a sender, recipient, nonce or amount either ledger cannot read.
+   *
+   * Skipping is not dropping. A skipped entry stays pending, so a sender that is
+   * credited later — or whose earlier transfer lands — can still see it included
+   * at a later height. Expiry for an entry that never becomes payable is
+   * deliberately left as later work; until then it occupies one of its sender's
+   * MAX_MEMPOOL_PER_SENDER slots and nothing else.
+   *
+   * Nothing is removed and no ledger is written: like take(), this is a read.
+   */
+  selectForBlock(n: number): Transaction[] {
+    if (!Number.isFinite(n) || n <= 0) return []
+    const cap = Math.floor(n)
+
+    const ordered = Array.from(this.entries.values()).sort(
+      (a, b) => a.nonce - b.nonce || a.sequence - b.sequence
+    )
+
+    /** sender -> the highest nonce selected for it so far, this block. */
+    const nonceState = new Map<string, number>()
+    /** account -> its running balance, this block. */
+    const balanceState = new Map<string, number>()
+    const balanceOf = (account: string): number =>
+      balanceState.has(account)
+        ? (balanceState.get(account) as number)
+        : this.balances.balanceOf(account)
+
+    const chosen: Transaction[] = []
+    for (const entry of ordered) {
+      if (chosen.length >= cap) break
+      const tx = entry.tx
+      if (!tx || typeof tx !== "object") continue
+
+      const sender = tx.sender
+      const recipient = tx.recipient
+      if (typeof sender !== "string" || sender.length === 0) continue
+      if (typeof recipient !== "string" || recipient.length === 0) continue
+      if (!isUsableNumber(tx.nonce) || !isUsableNumber(tx.amount)) continue
+
+      // FRESH — mirrors NonceLedger.stage.
+      const seen = nonceState.has(sender)
+        ? (nonceState.get(sender) as number)
+        : this.nonces.lastNonce(sender)
+      if (seen !== undefined && tx.nonce <= seen) continue
+
+      // AFFORDABLE — mirrors BalanceLedger.stage: debit, then credit.
+      const held = balanceOf(sender)
+      if (held < tx.amount) continue
+      const senderAfter = held - tx.amount
+      // read the recipient AFTER the debit, so a self-transfer sees it
+      const credited =
+        (recipient === sender ? senderAfter : balanceOf(recipient)) + tx.amount
+      if (credited > Number.MAX_SAFE_INTEGER) continue
+
+      balanceState.set(sender, senderAfter)
+      balanceState.set(recipient, credited)
+      nonceState.set(sender, tx.nonce)
+      chosen.push(tx)
+    }
+
+    return chosen
   }
 
   /** Forget one id. Returns true if something was actually pending. */
