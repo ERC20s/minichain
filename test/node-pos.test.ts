@@ -3,7 +3,7 @@ import { keypairFromSeed, sign, Keypair } from "../src/crypto/ed25519"
 import { blockHash, createBlock, Block } from "../src/block"
 import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
-import { signedTx } from "./helpers/signed-tx"
+import { funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -64,11 +64,15 @@ describe("Node enforces stake-weighted proposer selection", () => {
     const [portA, portB, portC] = ports
     // Started downstream first: each node dials its peer once, at construction,
     // so the listener has to exist before the dialler is built.
-    const nodeC = new Node(portC, [], genesis)
+    // account 12 sends the transfer in the block below, so every node on the
+    // path opens with it funded — an unaffordable transfer is dropped for
+    // insolvency, which would hide what these tests are about
+    const opening = funded([12])
+    const nodeC = new Node(portC, [], genesis, [], opening)
     await wait(60)
-    const nodeB = new Node(portB, [`ws://127.0.0.1:${portC}`], genesis, validators)
+    const nodeB = new Node(portB, [`ws://127.0.0.1:${portC}`], genesis, validators, opening)
     await wait(60)
-    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis)
+    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
     const blk = createBlock(blockHash(genesis), 1, [
       signedTx(12, { recipient: "bob", amount: 1, nonce: 1 }),

@@ -4,7 +4,7 @@ import { Block, blockHash, createBlock, transactionLeaves } from "../src/block"
 import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { merkleRoot } from "../src/merkle"
 import { Transaction } from "../src/types/transaction"
-import { signedTx } from "./helpers/signed-tx"
+import { funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -67,9 +67,12 @@ describe("a padded transaction list cannot forge a block", () => {
 
   async function deliver(blk: Block, ports: [number, number]) {
     const [portA, portB] = ports
-    const nodeB = new Node(portB, [], genesis)
+    // the three senders are funded, so the padded block below is dropped for
+    // its Merkle root and not for an unaffordable transfer
+    const opening = funded([1, 2, 3])
+    const nodeB = new Node(portB, [], genesis, [], opening)
     await wait(60)
-    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis)
+    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
     const sig = signBlock(honest, proposer) // header signature, identical for both blocks
     await wait(100)

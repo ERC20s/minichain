@@ -1,7 +1,7 @@
 import { Node } from "../src/node"
 import { keypairFromSeed, sign } from "../src/crypto/ed25519"
 import { blockHash, createBlock } from "../src/block"
-import { signedTx } from "./helpers/signed-tx"
+import { funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -14,8 +14,10 @@ describe("in-memory Node syncing over gossip", () => {
 
     const genesis = createBlock("0x00", 0, [])
 
-    const nodeA = new Node(portA, [urlB], genesis)
-    const nodeB = new Node(portB, [urlA], genesis)
+    // both nodes open with account 11 funded: the transfer below is affordable
+    const opening = funded([11])
+    const nodeA = new Node(portA, [urlB], genesis, [], opening)
+    const nodeB = new Node(portB, [urlA], genesis, [], opening)
 
     const seed = new Uint8Array(32)
     seed[0] = 2

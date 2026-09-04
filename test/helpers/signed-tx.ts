@@ -23,6 +23,23 @@ export function accountHex(seedByte: number): string {
   return bytesToHex(account(seedByte).publicKey)
 }
 
+/**
+ * Opening balances for a Node: every listed seed byte's account credited the
+ * same amount.
+ *
+ * A node now refuses a transfer its sender cannot afford (src/state/balances.ts),
+ * and these fixtures spend from accounts that never appear in genesis, so any
+ * test that expects a transfer to LAND has to fund its senders — otherwise the
+ * block is dropped for insolvency and the assertion under test never runs.
+ *
+ * Pass it as the fifth Node argument: new Node(port, peers, genesis, [], funded([11])).
+ */
+export function funded(seedBytes: number[], amount = 1000000): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const seedByte of seedBytes) out[accountHex(seedByte)] = amount
+  return out
+}
+
 /** A transaction signed by the seed byte's account; `sender` comes from the key. */
 export function signedTx(
   seedByte: number,

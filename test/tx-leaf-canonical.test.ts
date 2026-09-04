@@ -9,7 +9,7 @@ import {
 import { merkleRoot } from "../src/merkle"
 import { TransactionSignatureError } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
-import { signedTx } from "./helpers/signed-tx"
+import { funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -124,9 +124,12 @@ describe("merkle leaves are canonical transaction bytes", () => {
   describe("over gossip", () => {
     async function deliver(blk: Block, ports: [number, number]) {
       const [portA, portB] = ports
-      const nodeB = new Node(portB, [], genesis)
+      // the three senders are funded, so every variant below is judged on its
+      // leaves and not on whether the transfers are affordable
+      const opening = funded([1, 2, 3])
+      const nodeB = new Node(portB, [], genesis, [], opening)
       await wait(60)
-      const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis)
+      const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
       // the header signature is over the HONEST header, which every variant
       // below shares, so only the recomputed leaves can tell them apart
