@@ -204,10 +204,37 @@ function concat(parts: Uint8Array[]): Uint8Array {
   return out
 }
 
+/**
+ * The only fields a transaction may carry. The encoder covers exactly these, so
+ * anything else on the object is invisible to the bytes: without this check a
+ * relay could bolt an extra field onto a transaction and the leaf hash, the
+ * Merkle root, the block hash and the proposer's header signature would all
+ * stay valid. Rejecting unknown fields keeps the encoding injective over the
+ * OBJECT, not merely over the five fields it happens to read.
+ */
+export const CANONICAL_TX_FIELDS = [
+  "sender",
+  "recipient",
+  "amount",
+  "nonce",
+  "payload",
+] as const
+
+const CANONICAL_TX_FIELD_SET: ReadonlySet<string> = new Set(CANONICAL_TX_FIELDS)
+
 export function canonicalEncoding(tx: Transaction): Uint8Array {
   if (tx === null || typeof tx !== "object") {
     throw new CanonicalEncodingError(
       `transaction must be an object, got ${describe(tx)}`
+    )
+  }
+  const unknown = Object.keys(tx as Record<string, unknown>)
+    .filter((k) => !CANONICAL_TX_FIELD_SET.has(k))
+    .sort()
+  if (unknown.length > 0) {
+    throw new CanonicalEncodingError(
+      `transaction has unknown field(s) ${unknown.join(", ")}; only ` +
+        `${CANONICAL_TX_FIELDS.join(", ")} can be encoded`
     )
   }
   const parts: Uint8Array[] = []

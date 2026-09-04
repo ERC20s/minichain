@@ -1,7 +1,7 @@
 import { Node } from "../src/node"
 import { keypairFromSeed, sign, Keypair } from "../src/crypto/ed25519"
 import { Block, blockHash, createBlock } from "../src/block"
-import { canonicalBlockEncoding } from "../src/coding/serialize"
+import { canonicalBlockEncoding, canonicalEncoding } from "../src/coding/serialize"
 import { merkleRoot } from "../src/merkle"
 import { Transaction } from "../src/types/transaction"
 
@@ -24,8 +24,9 @@ function signBlock(blk: Block, keypair: Keypair): Uint8Array {
   return sign(msg, keypair.secretKey)
 }
 
+/** Leaves are the canonical transaction encoding, the same bytes src/block.ts hashes. */
 function rootOf(txs: Transaction[]): string {
-  return merkleRoot(txs.map((tx) => new TextEncoder().encode(JSON.stringify(tx))))
+  return merkleRoot(txs.map((tx) => canonicalEncoding(tx)))
 }
 
 /**
