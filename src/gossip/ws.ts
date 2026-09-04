@@ -53,8 +53,33 @@ export type GossipMessage = {
 export type GossipNode = {
   broadcast: (type: GossipMessageType, payload: Uint8Array, opts?: { sig?: Uint8Array; pubKey?: Uint8Array }) => void
   on: (type: string, cb: (msg: GossipMessage) => void) => void
+  /**
+   * Called every time an OUTBOUND peer socket opens — the first dial and every
+   * successful re-dial after it. The argument is the peer URL that opened.
+   *
+   * It exists because a link that has just come up is exactly the moment a node
+   * may be behind: it was started before its peer was listening, or the peer
+   * restarted while blocks were minted. src/node.ts uses it to send one catch-up
+   * "req" at once instead of waiting for a future block to notice the gap.
+   */
+  onPeerOpen: (cb: (url: string) => void) => void
   close: () => void
 }
+
+/**
+ * Outbound re-dial backoff.
+ *
+ * The transport used to dial each peer exactly once, at startup: a dial that
+ * failed was forgotten and a peer that restarted was deleted from the client set
+ * for good, so broadcast() wrote into an empty set and the node gossiped into
+ * silence. Every peer now keeps being re-dialled, waiting MIN and doubling to
+ * MAX between attempts (plus jitter, so a mesh restarted together does not
+ * reconnect in lockstep), reset to MIN as soon as the socket opens.
+ */
+export const PEER_RECONNECT_MIN_MS = 500
+export const PEER_RECONNECT_MAX_MS = 15000
+/** Up to this fraction of the delay is added at random, so peers spread out. */
+export const PEER_RECONNECT_JITTER = 0.25
 
 // defensive limits
 const ALLOWED_TYPES = new Set(["tx", "blk", "req"])
@@ -185,22 +210,97 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
   })
 
   // connect to peers
+  //
+  // One connectPeer() per configured URL, and it never gives up: a socket that
+  // closes or errors schedules the next dial after a backoff, and a socket that
+  // opens resets that backoff to the minimum. This is what makes the two most
+  // ordinary things in a small mesh survivable — starting node A with PEERS
+  // pointing at a node B that is not listening yet, and restarting any node.
   const clients: Set<WebSocket> = new Set()
-  for (const p of peers) {
-    try {
-      const c = new WebSocket(p)
-      c.on("open", () => {
-        clients.add(c)
-      })
-      c.on("message", (data: WebSocket.Data) => {
-        handleIncomingMessage(data, c)
-      })
-      c.on("close", () => clients.delete(c))
-      c.on("error", () => clients.delete(c))
-    } catch (e) {
-      // ignore
-    }
+  // Every outbound socket, open or still connecting, so close() can shut a
+  // half-dialled one too. `clients` holds only the OPEN sockets broadcast writes to.
+  const peerSockets: Set<WebSocket> = new Set()
+  const peerOpenListeners: ((url: string) => void)[] = []
+  const reconnectTimers: Set<ReturnType<typeof setTimeout>> = new Set()
+  let closed = false
+
+  function backoffDelay(attempt: number): number {
+    const n = attempt < 1 ? 1 : attempt
+    // 500, 1000, 2000 ... capped at 15000. Math.pow is bounded by the cap, so a
+    // long-dead peer cannot overflow the exponent into Infinity.
+    const capped = Math.min(
+      PEER_RECONNECT_MAX_MS,
+      PEER_RECONNECT_MIN_MS * Math.pow(2, Math.min(n - 1, 32))
+    )
+    return Math.round(capped + Math.random() * capped * PEER_RECONNECT_JITTER)
   }
+
+  function connectPeer(url: string, attempt: number = 0): void {
+    if (closed) return
+
+    // "error" is followed by "close" on almost every failed dial, so without
+    // this flag one failure would schedule two re-dials and the peer's dial rate
+    // would double at every round. One scheduled re-dial per connectPeer call.
+    let scheduled = false
+    const scheduleRetry = () => {
+      if (scheduled || closed) return
+      scheduled = true
+      const timer = setTimeout(() => {
+        reconnectTimers.delete(timer)
+        connectPeer(url, attempt + 1)
+      }, backoffDelay(attempt + 1))
+      // Never hold a process — or a jest run — open just to wait for a re-dial.
+      if (typeof (timer as any).unref === "function") (timer as any).unref()
+      reconnectTimers.add(timer)
+    }
+
+    let dialled: WebSocket | undefined
+    try {
+      dialled = new WebSocket(url)
+    } catch (e) {
+      // A URL the ws constructor throws on (a bad scheme, say) is retried like
+      // any other failure rather than dropped for the lifetime of the node.
+      dialled = undefined
+    }
+    if (!dialled) {
+      scheduleRetry()
+      return
+    }
+    const c = dialled
+    peerSockets.add(c)
+
+    c.on("open", () => {
+      if (closed) {
+        try { c.close() } catch (e) {}
+        return
+      }
+      // The link is up: the next failure starts again from the minimum delay.
+      attempt = 0
+      clients.add(c)
+      for (const cb of peerOpenListeners) {
+        try {
+          cb(url)
+        } catch (e) {
+          // a listener that throws must not take the transport down
+        }
+      }
+    })
+    c.on("message", (data: WebSocket.Data) => {
+      handleIncomingMessage(data, c)
+    })
+    c.on("close", () => {
+      clients.delete(c)
+      peerSockets.delete(c)
+      scheduleRetry()
+    })
+    c.on("error", () => {
+      clients.delete(c)
+      peerSockets.delete(c)
+      scheduleRetry()
+    })
+  }
+
+  for (const p of Array.isArray(peers) ? peers : []) connectPeer(p)
 
   function broadcast(type: GossipMessageType, payload: Uint8Array, opts?: { sig?: Uint8Array; pubKey?: Uint8Array }) {
     const s = encodeEnvelope(type, payload, opts)
@@ -224,13 +324,27 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     listeners.set(type, arr)
   }
 
+  function onPeerOpen(cb: (url: string) => void) {
+    if (typeof cb === "function") peerOpenListeners.push(cb)
+  }
+
   function close() {
+    // Set FIRST: every close below fires a "close" event, and without the flag
+    // each one would schedule the re-dial this call is meant to stop.
+    closed = true
+    for (const t of reconnectTimers) {
+      try { clearTimeout(t) } catch (e) {}
+    }
+    reconnectTimers.clear()
     try {
       server.close()
     } catch (e) {}
+    for (const c of peerSockets) try { c.close() } catch (e) {}
     for (const c of clients) try { c.close() } catch (e) {}
     for (const s of sockets) try { s.close() } catch (e) {}
+    clients.clear()
+    peerSockets.clear()
   }
 
-  return { broadcast, on, close }
+  return { broadcast, on, onPeerOpen, close }
 }

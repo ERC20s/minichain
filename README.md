@@ -10,7 +10,9 @@ A chain built from scratch in TypeScript - blocks, ed25519 signatures, Merkle ro
 Settings (see `.env.example`; values live on the box, never in the repository):
 
 - `PORT` — the gossip WebSocket port. Default 9300.
-- `PEERS` — comma-separated `ws://host:port` peers to dial.
+- `PEERS` — comma-separated `ws://host:port` peers to dial. Start order does not
+  matter: a peer that is not listening yet, or that restarts later, is re-dialled
+  (see **Reconnecting peers** below).
 - `VALIDATORS` — the staked set, `hexkey:stake,hexkey:stake`. Unset means any
   validly signed block is accepted; set means only the stake-elected proposer's.
 - `RPC_PORT` — the JSON-RPC HTTP port. Default 9310, `0` turns it off.
@@ -84,9 +86,39 @@ stake-elected proposer — so a peer that answers with rubbish only wastes its o
 bandwidth. Applying the batch in order is what makes it work: each block in turn
 becomes the tip the next one is judged against.
 
+A node also asks the moment a peer link comes up — see **Reconnecting peers**
+below — so a node that reconnects to a quiet chain does not sit at its old tip
+waiting for the next block to be minted.
+
 Limits worth knowing: a node more than 1024 blocks behind (or behind a peer whose
 window has moved past its tip) cannot be helped this way and must restart from
 genesis, nothing is persisted across restarts, and there is still no fork choice.
+
+## Reconnecting peers
+
+Each `PEERS` entry is dialled and **kept** dialled (`src/gossip/ws.ts`). The
+transport used to dial every peer exactly once, at startup: a dial that failed
+was forgotten and a peer that restarted was removed from the outbound set for
+good, so `broadcast()` wrote into an empty set and the node gossiped into
+silence. Two everyday things did it — starting a node before the peer named in
+`PEERS` was listening, and restarting any node.
+
+Now a peer socket that closes or errors is re-dialled after a backoff: 500 ms,
+doubling to a ceiling of 15 s, plus up to 25% jitter so a mesh restarted together
+does not reconnect in lockstep. The delay resets to 500 ms as soon as the socket
+opens, only one re-dial is ever scheduled per peer (an `error` is normally
+followed by a `close`, and that pair must not double the dial rate), and
+`GossipNode.close()` clears every pending timer and stops re-dialling for good.
+The timers are `unref`'d, so a pending re-dial never keeps a process or a test
+run alive.
+
+When an outbound socket opens, the transport fires `onPeerOpen(url)` and the node
+sends one catch-up `req` (rate limited exactly as any other, one per second), so
+a node that has just reconnected asks for `tip.height + 1` immediately.
+
+A peer that is permanently gone is still dialled once every 15 s or so for as
+long as the node runs; nothing is dropped from `PEERS` at runtime, and there is
+no peer discovery.
 
 ## Pending transactions
 

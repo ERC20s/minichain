@@ -258,6 +258,27 @@ export class Node {
         // ignore malformed
       }
     })
+
+    // a peer link came up: ask for the gap straight away.
+    //
+    // The transport re-dials a peer that was not listening yet, or that
+    // restarted (src/gossip/ws.ts), and fires this when the socket opens. That
+    // moment is exactly when this node is most likely to be behind, and until
+    // now nothing asked: the only trigger for a catch-up request was REFUSING a
+    // future block, so a node that reconnected to a quiet chain sat at its old
+    // tip until the next block happened to be minted.
+    //
+    // Nothing here is unbounded: requestSync() is rate limited to one request
+    // per syncRequestIntervalMs on this node's own clock, so several peers
+    // opening at once still produce one "req", and an answer is capped at
+    // MAX_SYNC_BLOCKS blocks judged by the ordinary acceptBlock path.
+    try {
+      this.gossip.onPeerOpen(() => {
+        this.requestSync()
+      })
+    } catch (e) {
+      // a transport without the hook simply keeps the old behaviour
+    }
   }
 
   /**
