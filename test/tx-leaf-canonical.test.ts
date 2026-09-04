@@ -7,7 +7,9 @@ import {
   CanonicalEncodingError,
 } from "../src/coding/serialize"
 import { merkleRoot } from "../src/merkle"
+import { TransactionSignatureError } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
+import { signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -44,9 +46,9 @@ describe("merkle leaves are canonical transaction bytes", () => {
   const proposer = kp(51)
 
   const txs: Transaction[] = [
-    { sender: "alice", recipient: "bob", amount: 1, nonce: 1 },
-    { sender: "bob", recipient: "carol", amount: 2, nonce: 1 },
-    { sender: "carol", recipient: "alice", amount: 3, nonce: 1 },
+    signedTx(1, { recipient: "bob", amount: 1, nonce: 1 }),
+    signedTx(2, { recipient: "carol", amount: 2, nonce: 1 }),
+    signedTx(3, { recipient: "alice", amount: 3, nonce: 1 }),
   ]
 
   const genesis = createBlock("0x00", 0, [])
@@ -55,10 +57,17 @@ describe("merkle leaves are canonical transaction bytes", () => {
   describe("leaf identity", () => {
     it("gives one root whatever order the keys were written in", () => {
       const written: Transaction[] = [
-        { sender: "alice", recipient: "bob", amount: 1, nonce: 1 },
+        signedTx(4, { recipient: "bob", amount: 1, nonce: 1 }),
       ]
+      const w = written[0]
       const reordered = [
-        { nonce: 1, amount: 1, recipient: "bob", sender: "alice" },
+        {
+          signature: w.signature,
+          nonce: w.nonce,
+          amount: w.amount,
+          recipient: w.recipient,
+          sender: w.sender,
+        },
       ] as unknown as Transaction[]
 
       // JSON.stringify keeps insertion order, so the old leaves differed...
@@ -97,6 +106,18 @@ describe("merkle leaves are canonical transaction bytes", () => {
       expect(() =>
         canonicalEncoding({ ...txs[0], payload: { note: "ok" } } as any)
       ).not.toThrow()
+    })
+
+    it("refuses an unsigned transaction", () => {
+      const { signature, ...unsigned } = txs[0] as any
+      expect(() => createBlock("0x00", 1, [unsigned])).toThrow(
+        TransactionSignatureError
+      )
+      // the signature is excluded from the SIGNING bytes (it cannot be part of
+      // its own preimage) but the leaf still commits to it — see tx-signature
+      expect(Array.from(canonicalEncoding(txs[0]))).toEqual(
+        Array.from(canonicalEncoding(unsigned))
+      )
     })
   })
 

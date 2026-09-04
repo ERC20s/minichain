@@ -220,7 +220,26 @@ export const CANONICAL_TX_FIELDS = [
   "payload",
 ] as const
 
-const CANONICAL_TX_FIELD_SET: ReadonlySet<string> = new Set(CANONICAL_TX_FIELDS)
+/**
+ * Fields the encoder KNOWS about but deliberately leaves out of the bytes.
+ *
+ * `signature` is the ed25519 signature MADE OVER this encoding, so it cannot be
+ * part of its own preimage. Excluding it here (rather than rejecting it as an
+ * unknown field) keeps canonicalEncoding usable as the signing preimage both
+ * before and after a transaction is signed, and leaves every signature and test
+ * vector made under the previous rules valid: the bytes for the five signed
+ * fields are byte-for-byte what they were.
+ *
+ * The signature is NOT left uncommitted, though — src/block.ts hashes the
+ * Merkle leaf over "stx:" || len(signature) || signature || canonicalEncoding(tx),
+ * so a relay that strips or swaps a signature changes the root.
+ */
+export const CANONICAL_TX_EXCLUDED_FIELDS = ["signature"] as const
+
+const CANONICAL_TX_KNOWN_FIELD_SET: ReadonlySet<string> = new Set([
+  ...CANONICAL_TX_FIELDS,
+  ...CANONICAL_TX_EXCLUDED_FIELDS,
+])
 
 export function canonicalEncoding(tx: Transaction): Uint8Array {
   if (tx === null || typeof tx !== "object") {
@@ -229,7 +248,7 @@ export function canonicalEncoding(tx: Transaction): Uint8Array {
     )
   }
   const unknown = Object.keys(tx as Record<string, unknown>)
-    .filter((k) => !CANONICAL_TX_FIELD_SET.has(k))
+    .filter((k) => !CANONICAL_TX_KNOWN_FIELD_SET.has(k))
     .sort()
   if (unknown.length > 0) {
     throw new CanonicalEncodingError(

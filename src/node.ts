@@ -3,6 +3,7 @@ import { Block, blockHash, createBlock, transactionLeaves } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
+import { verifyTransaction } from "./tx"
 import { Transaction } from "./types/transaction"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "./validators"
 
@@ -41,14 +42,29 @@ export class Node {
         // throws on anything it cannot represent, so a block carrying an
         // unencodable transaction is DROPPED here: the tip does not move and
         // nothing is re-broadcast.
+        const txs = (blk.transactions || []) as Transaction[]
         let txBytes: Uint8Array[]
         try {
-          txBytes = transactionLeaves((blk.transactions || []) as Transaction[])
+          txBytes = transactionLeaves(txs)
         } catch (e) {
           return
         }
         const mr = merkleRoot(txBytes)
         if (mr !== blk.merkleRoot) return
+
+        // per-transaction authorisation.
+        //
+        // The root above proves the block commits to exactly these transactions
+        // and the header signature below proves WHO proposed the block — neither
+        // says the sender agreed to be debited. Without this check an elected
+        // proposer could mint {sender: "alice", recipient: "me", amount: 1e6}
+        // and every node would accept and relay it. Each transaction must carry
+        // an ed25519 signature that verifies against the public key its own
+        // `sender` field names; one failure drops the whole block, so the tip
+        // does not move and nothing is re-broadcast.
+        for (const tx of txs) {
+          if (!verifyTransaction(tx)) return
+        }
 
         // require signature and pubKey
         if (!m.sig || !m.pubKey) return

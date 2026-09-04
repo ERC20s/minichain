@@ -3,6 +3,7 @@ import { Block, blockHash, createBlock } from "../src/block"
 import { canonicalBlockEncoding, CanonicalEncodingError } from "../src/coding/serialize"
 import { keypairFromSeed, sign } from "../src/crypto/ed25519"
 import { Node } from "../src/node"
+import { signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -13,7 +14,7 @@ function withTimestamp(b: Block, timestamp: number): Block {
 
 describe("blockHash identifies a block by its whole header", () => {
   it("two blocks with the same transactions share a merkleRoot but not a blockHash", () => {
-    const txs = [{ sender: "alice", recipient: "bob", amount: 1, nonce: 1 }]
+    const txs = [signedTx(21, { recipient: "bob", amount: 1, nonce: 1 })]
     const a = createBlock("0x00", 1, txs)
     const b = withTimestamp(a, a.timestamp + 1000)
 
@@ -36,14 +37,14 @@ describe("blockHash identifies a block by its whole header", () => {
   })
 
   it("is a 64-character hex digest and is deterministic", () => {
-    const b = createBlock("0x00", 3, [{ sender: "a", recipient: "b", amount: 2, nonce: 7 }])
+    const b = createBlock("0x00", 3, [signedTx(22, { recipient: "b", amount: 2, nonce: 7 })])
     const h = blockHash(b)
     expect(h).toMatch(/^[0-9a-f]{64}$/)
     expect(blockHash(b)).toBe(h)
   })
 
   it("survives a JSON.stringify/parse round trip", () => {
-    const b = createBlock("0x00", 1, [{ sender: "alice", recipient: "bob", amount: 1, nonce: 1 }])
+    const b = createBlock("0x00", 1, [signedTx(23, { recipient: "bob", amount: 1, nonce: 1 })])
     const wire = JSON.parse(JSON.stringify(b)) as Block
     expect(blockHash(wire)).toBe(blockHash(b))
   })
@@ -89,7 +90,7 @@ describe("a node links children by block hash, not by merkle root", () => {
 
     // a well-formed, correctly signed child of genesisA
     const child = createBlock(blockHash(genesisA), 1, [
-      { sender: "alice", recipient: "bob", amount: 1, nonce: 1 },
+      signedTx(24, { recipient: "bob", amount: 1, nonce: 1 }),
     ])
     const msg = canonicalBlockEncoding({
       parentHash: child.parentHash,

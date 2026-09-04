@@ -1,6 +1,7 @@
 import { Node } from "../src/node"
 import { keypairFromSeed, sign } from "../src/crypto/ed25519"
 import { blockHash, createBlock } from "../src/block"
+import { signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -21,7 +22,11 @@ describe("in-memory Node syncing over gossip", () => {
     const kp = keypairFromSeed(seed)
 
     // create a new block building on genesis, linked by the genesis BLOCK HASH
-    const blk = createBlock(blockHash(genesis), 1, [{ sender: "alice", recipient: "bob", amount: 1, nonce: 1 }])
+    // the transaction is signed by its sender: a block whose transactions are
+    // not authorised is dropped by the peer before the tip moves
+    const blk = createBlock(blockHash(genesis), 1, [
+      signedTx(11, { recipient: "bob", amount: 1, nonce: 1 }),
+    ])
 
     // sign canonical header
     const header = {

@@ -1,9 +1,10 @@
 import { Node } from "../src/node"
 import { keypairFromSeed, sign, Keypair } from "../src/crypto/ed25519"
-import { Block, blockHash, createBlock } from "../src/block"
-import { canonicalBlockEncoding, canonicalEncoding } from "../src/coding/serialize"
+import { Block, blockHash, createBlock, transactionLeaves } from "../src/block"
+import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { merkleRoot } from "../src/merkle"
 import { Transaction } from "../src/types/transaction"
+import { signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -24,9 +25,9 @@ function signBlock(blk: Block, keypair: Keypair): Uint8Array {
   return sign(msg, keypair.secretKey)
 }
 
-/** Leaves are the canonical transaction encoding, the same bytes src/block.ts hashes. */
+/** Leaves are the signed-transaction leaves src/block.ts hashes. */
 function rootOf(txs: Transaction[]): string {
-  return merkleRoot(txs.map((tx) => canonicalEncoding(tx)))
+  return merkleRoot(transactionLeaves(txs))
 }
 
 /**
@@ -40,9 +41,9 @@ describe("a padded transaction list cannot forge a block", () => {
   const proposer = kp(44)
 
   const txs: Transaction[] = [
-    { sender: "alice", recipient: "bob", amount: 1, nonce: 1 },
-    { sender: "bob", recipient: "carol", amount: 2, nonce: 1 },
-    { sender: "carol", recipient: "alice", amount: 3, nonce: 1 },
+    signedTx(1, { recipient: "bob", amount: 1, nonce: 1 }),
+    signedTx(2, { recipient: "carol", amount: 2, nonce: 1 }),
+    signedTx(3, { recipient: "alice", amount: 3, nonce: 1 }),
   ]
 
   const genesis = createBlock("0x00", 0, [])
