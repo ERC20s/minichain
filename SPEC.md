@@ -216,4 +216,33 @@ Files added or changed for block timestamp bounds
 - test/node-timestamp.test.ts (new: the exported default; equal-to-parent and slightly-ahead stamps accepted and relayed; a backwards stamp, a far-future stamp, a stamp outside a tighter configured drift and a fractional stamp each dropped without reaching a third node; the default drift stands when the option is missing or unusable)
 - SPEC.md (this section, and the "Grinding" note under proposer enforcement now records the bound)
 
+Read-only JSON-RPC API (new)
+- Purpose: the README and the project goal above have advertised "JSON-RPC" since the first cycle and nothing in the tree answered a question. Eleven cycles hardened what a node ACCEPTS — linkage, timestamp bounds, the Merkle root, per-transaction signatures, nonces, balances, the header signature and the elected proposer — while the state all of that maintains was reachable only from inside the process: a running node printed one line at startup and was otherwise opaque.
+- READ ONLY, by construction: no method submits a transaction, a block or a peer. src/node.ts is the one place a block is judged, and an RPC that could inject one would be a second, unauthenticated path around those checks. The server talks to the node through the RpcNode interface (tip, validators, balances.balanceOf, nonces.lastNonce) and nothing else, so gossip, broadcastBlock and the ledgers' stage/commit are out of its reach; widening the surface means widening that interface, which is visible in a diff.
+- Binding: 127.0.0.1 by default (DEFAULT_RPC_HOST). There is no authentication, no TLS and no rate limiting; anything wider than loopback belongs behind a reverse proxy. Port 0 asks the operating system for a free port, which is what the tests use.
+- Transport (Node's built-in http, no new dependency):
+  - POST only. Any other verb answers HTTP 405 with an Allow: POST header and a JSON-RPC error body.
+  - MAX_RPC_BODY_BYTES = 65536 (64 KiB), the same size the gossip transport allows a payload (MAX_PAYLOAD_HEX = 131072 hex characters, src/gossip/ws.ts). The cap is checked against the declared Content-Length AND against the bytes as they arrive, so a lying or absent length cannot make the node buffer more than the cap. An over-long body is DRAINED and answered with HTTP 413 rather than reset mid-write; a peer still streaming at eight times the cap has its connection dropped.
+  - Framing: jsonrpc must be exactly "2.0"; method must be a non-empty string; params must be an object, an array or absent; id must be a string, a number, null or absent. A request with no id is a notification — every method is a pure read, so nothing is executed and the answer is HTTP 204 with no body. Batch (array) requests are refused as an invalid request rather than half-handled.
+  - HTTP status: 200 for a result, 400 for a malformed or unknown call, 405, 413 and 500 for transport-level failures. The JSON-RPC error object carries the real code either way.
+- Error codes: -32700 parse error, -32600 invalid request, -32601 method not found (its `data.methods` lists what the server does answer), -32602 invalid params, -32603 internal error. An unexpected throw inside a method (a CanonicalEncodingError out of blockHash, say) becomes -32603 with a generic message; it never escapes the request.
+- Methods:
+  - chain_height -> {height} — the height of this node's tip.
+  - chain_tip -> {hash, parentHash, height, timestamp, merkleRoot, transactionCount}, where hash is blockHash(tip) (the whole-header hash of "Block hash and chain linkage").
+  - chain_getBalance({account}) or ([account]) -> {account, balance} from BalanceLedger.balanceOf; an account never credited holds 0.
+  - chain_getNonce({account}) -> {account, nonce}, the last nonce accepted for that sender or null when this node has seen none. null and 0 are different answers: 0 means a nonce-0 transaction landed.
+  - chain_validators -> {validators, totalStake, enforced} — the staked set this node enforces; an empty set is the permissive path.
+  The account argument is accepted by name (account, or sender/address as aliases) or positionally; anything else is -32602 rather than a silent lookup of "undefined".
+- Configuration: examples/run-node.ts reads RPC_PORT (default 9310, 0 disables) and starts the server beside the node, logging the URL and the method list, and closes it in shutdown(). The name RPC_PORT is declared in the keys: block of the root .d8a and in .env.example; values live on the box, never in the repository. The run: dev entry in .d8a declares port 9310, because that is the HTTP surface worth proxying — 9300 is a raw WebSocket gossip port and answers no HTTP request.
+- Not a wire-format or consensus change: no encoding, signature, leaf, root or block hash changes, and which blocks a node accepts is untouched. What is new is a listening TCP port; it can be closed with RPC_PORT=0.
+- Later work: batch requests, subscriptions or long-polling for new tips, chain_getBlock by height or hash (a node keeps only its tip today, so there is no history to serve), and — only with authentication and an explicit decision — a submit path.
+
+Files added or changed for the read-only JSON-RPC API
+- src/rpc/server.ts (new: startRpcServer, RpcNode, RpcError, RPC_METHODS/RPC_METHOD_NAMES, the body cap, the framing and the error mapping)
+- examples/run-node.ts (RPC_PORT parsing, the server started beside the node and closed in shutdown; a shared parsePort helper that refuses a non-port value instead of handing NaN to listen)
+- test/rpc.test.ts (new: the genesis tip; height, tip, balances and nonces following an accepted block over gossip; the staked set; each error code; POST-only and the 64 KiB cap with a just-under-the-cap call still answered; a 204 notification; -32603 from a tip that cannot be hashed; close() stops answering; and an assertion that the method list contains nothing that writes)
+- .env.example and .d8a keys: (the RPC_PORT name), .d8a run: (the dev entry's port 9300 -> 9310)
+- README.md (running a node, the settings and the RPC method table)
+- SPEC.md (this section)
+
 If this passes, a contributor will open a PR adding src/validators.ts, test/validators.test.ts and this SPEC.md update implementing deterministic stake-weighted selection; reviewers will run npm test and ensure all tests pass.

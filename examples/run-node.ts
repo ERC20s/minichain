@@ -1,6 +1,7 @@
 import { Node } from "../src/node"
 import { createBlock } from "../src/block"
 import { Validator } from "../src/validators"
+import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, RPC_METHOD_NAMES, startRpcServer } from "../src/rpc/server"
 
 function parsePeers(env?: string): string[] {
   if (!env) return []
@@ -37,9 +38,29 @@ function parseValidators(env?: string): Validator[] {
   return out
 }
 
-const port = Number(process.env.PORT ? parseInt(process.env.PORT, 10) : 9300)
+/**
+ * A port setting that must be a usable TCP port; anything else falls back to
+ * the default with a warning rather than handing NaN to listen().
+ */
+function parsePort(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback
+  const value = parseInt(raw, 10)
+  if (!Number.isInteger(value) || value < 0 || value > 65535) {
+    console.warn(`ignoring ${name}=${raw}: not a port number, using ${fallback}`)
+    return fallback
+  }
+  return value
+}
+
+const port = parsePort("PORT", process.env.PORT, 9300)
 const peers = parsePeers(process.env.PEERS)
 const validators = parseValidators(process.env.VALIDATORS)
+/**
+ * The read-only JSON-RPC surface (src/rpc/server.ts). It binds loopback, so it
+ * is a way to ask a node what it knows, never a second way to put a block into
+ * it. RPC_PORT=0 disables it.
+ */
+const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
 
 const genesis = createBlock("genesis", 0, [])
 const node = new Node(port, peers, genesis, validators)
@@ -53,9 +74,37 @@ if (validators.length) {
   console.log("validators: none configured — any validly signed block is accepted")
 }
 
+/**
+ * The JSON-RPC surface, started next to the node. Read-only and loopback-bound:
+ * it exposes the tip, balances, nonces and the staked set, and no method on it
+ * can submit a transaction or a block, so the acceptance rules in src/node.ts
+ * stay the only way into this chain.
+ */
+const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, DEFAULT_RPC_HOST) : null
+if (rpc) {
+  rpc
+    .ready()
+    .then((bound) => {
+      console.log(`json-rpc listening on http://${DEFAULT_RPC_HOST}:${bound} (POST, read-only)`)
+      console.log(`json-rpc methods: ${RPC_METHOD_NAMES.join(", ")}`)
+    })
+    .catch((err: Error) => {
+      console.warn(`json-rpc not started on port ${rpcPort}: ${err.message}`)
+    })
+} else {
+  console.log("json-rpc: disabled (RPC_PORT=0)")
+}
+
 function shutdown() {
   console.log("shutting down")
   try { node.close() } catch (e) {}
+  if (rpc) {
+    // Stop listening before the process goes, so a restart can rebind the port.
+    // The timer is a ceiling on how long shutdown may wait for that.
+    setTimeout(() => process.exit(0), 500)
+    rpc.close().then(() => process.exit(0), () => process.exit(0))
+    return
+  }
   process.exit(0)
 }
 
