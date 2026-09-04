@@ -1,4 +1,4 @@
-import { startGossipNode } from "../src/gossip/ws"
+import { startGossipNode, MAX_ENVELOPE_CHARS } from "../src/gossip/ws"
 import { keypairFromSeed, sign, verify } from "../src/crypto/ed25519"
 import { canonicalEncoding } from "../src/coding/serialize"
 
@@ -110,4 +110,75 @@ describe("gossip websocket transport", () => {
 
     expect(received).toBe(false)
   }, 1000)
+
+  it("drops a frame that is too large to be an envelope without parsing it, and keeps serving", async () => {
+    const portA = 9401
+    const portB = 9402
+    const urlA = `ws://127.0.0.1:${portA}`
+    const urlB = `ws://127.0.0.1:${portB}`
+
+    const nodeA = startGossipNode(portA, [urlB])
+    const nodeB = startGossipNode(portB, [urlA])
+
+    const delivered: string[] = []
+    nodeA.on("tx", (m) => {
+      delivered.push(new TextDecoder().decode(m.payload))
+    })
+
+    await wait(50)
+
+    const ws = new (require("ws"))(urlA)
+    await new Promise((res) => ws.on("open", res))
+
+    // 1 MiB of JSON: far past any envelope this transport can accept, so the
+    // size guard must reject it before JSON.parse allocates the object graph.
+    const huge = JSON.stringify({ type: "tx", payloadHex: "a".repeat(1024 * 1024) })
+    expect(huge.length).toBeGreaterThan(MAX_ENVELOPE_CHARS)
+    const started = Date.now()
+    ws.send(huge)
+    await wait(150)
+
+    // the same connection still carries a normal message afterwards
+    const good = JSON.stringify({ type: "tx", payloadHex: "abcd" })
+    ws.send(good)
+    await wait(150)
+
+    ws.close()
+    nodeA.close()
+    nodeB.close()
+
+    expect(delivered.length).toBe(1)
+    expect(Date.now() - started).toBeLessThan(2000)
+  }, 3000)
+
+  it("still delivers an envelope that sits just under the size limit", async () => {
+    const portA = 9501
+    const portB = 9502
+    const urlA = `ws://127.0.0.1:${portA}`
+    const urlB = `ws://127.0.0.1:${portB}`
+
+    const nodeA = startGossipNode(portA, [urlB])
+    const nodeB = startGossipNode(portB, [urlA])
+
+    // 64 KiB payload (131072 hex chars = MAX_PAYLOAD_HEX) plus a 64-byte
+    // signature and a 32-byte public key: the biggest legal envelope.
+    const payload = new Uint8Array(65536)
+    for (let i = 0; i < payload.length; i++) payload[i] = i % 251
+
+    let got: Uint8Array | undefined
+    nodeB.on("tx", (m) => {
+      got = m.payload
+    })
+
+    await wait(50)
+    nodeA.broadcast("tx", payload, { sig: new Uint8Array(64), pubKey: new Uint8Array(32) })
+    await wait(300)
+
+    nodeA.close()
+    nodeB.close()
+
+    expect(got).toBeDefined()
+    expect(got!.length).toBe(payload.length)
+    expect(got!).toEqual(payload)
+  }, 2000)
 })

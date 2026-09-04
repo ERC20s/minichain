@@ -30,12 +30,48 @@ const MAX_SIG_HEX = 1024
 const MAX_PUBKEY_HEX = 1024
 const HEX_RE = /^[0-9a-fA-F]*$/
 
+// JSON syntax, field names and quotes around the three hex fields. The largest
+// envelope this transport ever SENDS is
+//   {"type":"blk","payloadHex":"...","sigHex":"...","pubKeyHex":"..."}
+// which is 66 characters of framing plus the hex fields, so 200 is a generous
+// margin that still leaves the limit tied to the maxima checked below.
+const ENVELOPE_OVERHEAD_CHARS = 200
+export const MAX_ENVELOPE_CHARS =
+  MAX_PAYLOAD_HEX + MAX_SIG_HEX + MAX_PUBKEY_HEX + ENVELOPE_OVERHEAD_CHARS
+
+// A UTF-8 sequence never uses more than 3 bytes per UTF-16 code unit (a 3-byte
+// BMP character is one unit; a 4-byte character is two units), so a frame over
+// this many BYTES cannot decode to a string within MAX_ENVELOPE_CHARS. Checking
+// it first lets us drop a huge binary frame without even building the string.
+const MAX_ENVELOPE_BYTES = MAX_ENVELOPE_CHARS * 3
+
 function validHexString(s: any, maxLen: number): s is string {
   if (typeof s !== "string") return false
   if (s.length % 2 !== 0) return false
   if (s.length > maxLen) return false
   if (!HEX_RE.test(s)) return false
   return true
+}
+
+// Size of an incoming ws frame in bytes, without converting it to a string.
+// Returns undefined when the size cannot be determined cheaply (e.g. the frame
+// was already delivered as a string), in which case the caller falls back to
+// the character check.
+function incomingByteLength(data: any): number | undefined {
+  if (data === null || data === undefined) return undefined
+  if (typeof data === "string") return undefined
+  if (Array.isArray(data)) {
+    let total = 0
+    for (const part of data) {
+      const n = incomingByteLength(part)
+      if (n === undefined) return undefined
+      total += n
+    }
+    return total
+  }
+  if (typeof data.byteLength === "number") return data.byteLength
+  if (typeof data.length === "number") return data.length
+  return undefined
 }
 
 export function startGossipNode(port: number, peers: string[]): GossipNode {
@@ -50,7 +86,12 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
 
   function handleIncomingMessage(data: WebSocket.Data) {
     try {
+      // Size first: a peer that sends megabytes of JSON should cost us a
+      // length comparison, not a parse and the allocations behind it.
+      const bytes = incomingByteLength(data)
+      if (bytes !== undefined && bytes > MAX_ENVELOPE_BYTES) return
       const s = typeof data === "string" ? data : data.toString()
+      if (s.length > MAX_ENVELOPE_CHARS) return
       const env = JSON.parse(s) as MsgEnvelope
       // validate envelope before decoding hex
       if (!ALLOWED_TYPES.has(env.type)) return
