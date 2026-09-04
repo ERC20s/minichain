@@ -4,6 +4,7 @@ import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
 import { BalanceLedger, OpeningBalances } from "./state/balances"
+import { Mempool, MempoolOptions, MempoolResult } from "./state/mempool"
 import { NonceLedger } from "./state/nonces"
 import { verifyTransaction } from "./tx"
 import { Transaction } from "./types/transaction"
@@ -25,6 +26,8 @@ export interface NodeOptions {
   maxFutureDriftMs?: number
   /** Overrides Date.now, so a test can place "now" wherever it likes. */
   now?: () => number
+  /** Overrides the mempool caps (see src/state/mempool.ts). */
+  mempool?: MempoolOptions
 }
 
 export class Node {
@@ -48,6 +51,12 @@ export class Node {
    * proves it is affordable.
    */
   balances: BalanceLedger
+  /**
+   * Transactions that are not in a block yet: validated against exactly the
+   * rules below (signature, nonce, balance), bounded, and relayed once. See
+   * src/state/mempool.ts — it holds pending transfers and moves no state.
+   */
+  mempool: Mempool
 
   constructor(
     port: number,
@@ -68,6 +77,33 @@ export class Node {
     this.validators = Array.isArray(validators) ? validators : []
     this.nonces = new NonceLedger(genesis ? genesis.transactions : [])
     this.balances = new BalanceLedger(genesis ? genesis.transactions : [], openingBalances)
+    this.mempool = new Mempool(this.nonces, this.balances, options && options.mempool)
+
+    // pending transactions.
+    //
+    // The transport has always accepted this frame type (ALLOWED_TYPES =
+    // {"tx", "blk"}, src/gossip/ws.ts) and nothing listened for it, so a
+    // gossiped transaction was decoded, emitted and dropped on the floor. It is
+    // admitted to the pool here under the SAME rules a block is judged by — the
+    // ed25519 transaction signature, a nonce strictly above what this node has
+    // accepted for the sender, and a balance that covers the amount together
+    // with that sender's other pending transfers — and re-broadcast ONLY on
+    // first admission. A transaction that is already pending, or that fails a
+    // rule, is not relayed, so two peers cannot bounce one between them for
+    // ever. Nothing here touches the tip or writes a ledger.
+    this.gossip.on("tx", (m) => {
+      try {
+        // payload is a JSON-encoded signed Transaction
+        const s = new TextDecoder().decode(m.payload)
+        const tx = JSON.parse(s) as Transaction
+        if (!this.mempool.add(tx).admitted) return
+        // relay the bytes as they arrived: re-encoding could reorder keys and
+        // the signature is over the canonical body, not over this JSON.
+        this.gossip.broadcast("tx", m.payload)
+      } catch (e) {
+        // ignore malformed
+      }
+    })
 
     this.gossip.on("blk", (m) => {
       try {
@@ -212,6 +248,10 @@ export class Node {
         this.tip = blk
         this.nonces.commit(staged)
         this.balances.commit(stagedBalances)
+        // and the pool forgets what this block committed, plus anything the new
+        // nonces just made impossible. Run after the commits, so it reads the
+        // ledgers at the new tip.
+        this.mempool.drop(txs)
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
@@ -219,6 +259,23 @@ export class Node {
         // ignore malformed
       }
     })
+  }
+
+  /**
+   * Offer a locally built transaction to this node.
+   *
+   * It goes through the same pool rules as anything off the wire — no local
+   * shortcut — and is broadcast to peers only if this node admits it, so a
+   * transaction this node would itself refuse is never pushed at the network.
+   * Returns the pool's answer, so a caller can see WHY a transfer was refused.
+   */
+  submitTransaction(tx: Transaction): MempoolResult {
+    const result = this.mempool.add(tx)
+    if (result.admitted) {
+      const payload = new TextEncoder().encode(JSON.stringify(tx))
+      this.gossip.broadcast("tx", payload)
+    }
+    return result
   }
 
   // helper to broadcast a signed block from this node

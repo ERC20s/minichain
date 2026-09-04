@@ -197,6 +197,44 @@ describe("read-only JSON-RPC server", () => {
     expect(nonce.body.result.nonce).toBe(node.nonces.lastNonce(accountHex(21)))
   }, 10000)
 
+  it("reports the pending-transaction pool, read-only", async () => {
+    const empty = await call(port, "chain_mempool")
+    expect(empty.status).toBe(200)
+    expect(empty.body.result).toEqual({ enabled: true, size: 0, pending: [], truncated: false })
+
+    // Account 21 spent nonce 7 in the block above and still holds 960, so this
+    // is signed, fresh and affordable: the node admits it to its own pool.
+    const tx = signedTx(21, { recipient: "bob", amount: 10, nonce: 8 })
+    const admitted = node.submitTransaction(tx)
+    expect(admitted.admitted).toBe(true)
+
+    const pooled = await call(port, "chain_mempool")
+    expect(pooled.body.result.enabled).toBe(true)
+    expect(pooled.body.result.size).toBe(1)
+    expect(pooled.body.result.pending).toEqual(node.mempool.ids())
+    expect(pooled.body.result.truncated).toBe(false)
+
+    // it takes no parameters, and it cannot change the pool
+    const wrong = await call(port, "chain_mempool", { account: accountHex(21) })
+    expect(wrong.body.error.code).toBe(RPC_INVALID_PARAMS)
+    expect(node.mempool.size).toBe(1)
+
+    // a node without a pool is answered, not errored
+    const stub = {
+      tip: node.tip,
+      validators: [],
+      balances: { balanceOf: () => 0 },
+      nonces: { lastNonce: () => undefined },
+    }
+    const handle = startRpcServer(stub, 0)
+    const stubPort = await handle.ready()
+    const none = await call(stubPort, "chain_mempool")
+    expect(none.body.result).toEqual({ enabled: false, size: 0, pending: [], truncated: false })
+    await handle.close()
+
+    node.mempool.clear()
+  }, 10000)
+
   it("answers -32700 for a body that is not JSON", async () => {
     const bad = await http(port, "{not json")
     expect(bad.status).toBe(400)
@@ -301,14 +339,17 @@ describe("read-only JSON-RPC server", () => {
     expect(blockHash(node.tip)).toBe(before)
     expect(node.balances.balanceOf(accountHex(21))).toBe(balanceBefore)
     expect(node.nonces.lastNonce(accountHex(21))).toBe(nonceBefore)
-    // The names are the audit: nothing here submits, sends or mines.
+    // The names are the audit: nothing here submits, sends or mines —
+    // chain_mempool reports the pool and cannot add to or drain it.
     expect(RPC_METHOD_NAMES).toEqual([
       "chain_height",
       "chain_tip",
       "chain_getBalance",
       "chain_getNonce",
+      "chain_mempool",
       "chain_validators",
     ])
+    expect(node.mempool.size).toBe(0)
   }, 10000)
 
   it("reports -32603 when a method itself fails", async () => {

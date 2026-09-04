@@ -2,6 +2,7 @@ import { Node } from "../src/node"
 import { createBlock } from "../src/block"
 import { Validator } from "../src/validators"
 import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, RPC_METHOD_NAMES, startRpcServer } from "../src/rpc/server"
+import { MAX_MEMPOOL, MAX_MEMPOOL_PER_SENDER } from "../src/state/mempool"
 
 function parsePeers(env?: string): string[] {
   if (!env) return []
@@ -73,12 +74,16 @@ if (validators.length) {
 } else {
   console.log("validators: none configured — any validly signed block is accepted")
 }
+console.log(
+  `mempool: gossiped transactions are validated, pooled and relayed once ` +
+    `(up to ${MAX_MEMPOOL} pending, ${MAX_MEMPOOL_PER_SENDER} per sender)`
+)
 
 /**
  * The JSON-RPC surface, started next to the node. Read-only and loopback-bound:
- * it exposes the tip, balances, nonces and the staked set, and no method on it
- * can submit a transaction or a block, so the acceptance rules in src/node.ts
- * stay the only way into this chain.
+ * it exposes the tip, balances, nonces, the pending-transaction pool and the
+ * staked set, and no method on it can submit a transaction or a block, so the
+ * acceptance rules in src/node.ts stay the only way into this chain.
  */
 const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, DEFAULT_RPC_HOST) : null
 if (rpc) {

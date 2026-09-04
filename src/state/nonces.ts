@@ -22,11 +22,13 @@ import { Transaction } from "../types/transaction"
  *   last nonce accepted for its sender, counting transactions earlier in the
  *   same block.
  *
- * Strictly increasing, not exactly last + 1. There is no mempool and no account
- * state here, so a node cannot tell a gap ("Alice's nonce 2 was dropped") from a
- * forgery, and a sequential rule would wrongly stall honest traffic for ever
- * after a single missing transaction. Monotonicity is what kills a replay; the
- * gap-free rule is a later cycle, once there is state to reason about.
+ * Strictly increasing, not exactly last + 1. A node cannot tell a gap ("Alice's
+ * nonce 2 was dropped") from a forgery from the chain alone, and a sequential
+ * rule would wrongly stall honest traffic for ever after a single missing
+ * transaction. Monotonicity is what kills a replay; the gap-free rule is a later
+ * cycle. The pending pool (src/state/mempool.ts) now holds transactions that
+ * have not landed, but it is local, unpersisted policy and deliberately does not
+ * feed this consensus rule.
  *
  * Two consequences a proposer must live with:
  *  - one sender's transactions must appear in a block in ascending nonce order,
