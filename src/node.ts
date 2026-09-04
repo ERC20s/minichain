@@ -1,5 +1,5 @@
 import { startGossipNode, GossipNode } from "./gossip/ws"
-import { Block, createBlock } from "./block"
+import { Block, blockHash, createBlock } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
@@ -21,7 +21,11 @@ export class Node {
 
         // basic linkage: must be exactly tip.height + 1
         if (typeof blk.height !== "number" || blk.height !== this.tip.height + 1) return
-        if (typeof blk.parentHash !== "string" || blk.parentHash !== this.tip.merkleRoot) return
+        // and must name THIS tip by its block hash. The tip's merkleRoot commits
+        // only to its transactions, so it linked a child equally well to any
+        // block carrying the same transaction list (every empty block shares
+        // one root); the header hash is unique to the block.
+        if (typeof blk.parentHash !== "string" || blk.parentHash !== blockHash(this.tip)) return
 
         // recompute merkle root from transactions
         const txBytes: Uint8Array[] = (blk.transactions || []).map((tx: Transaction) => {
