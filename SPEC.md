@@ -53,11 +53,25 @@ Block hash and chain linkage (new)
   "blkhash:" (8 ASCII bytes) || canonicalBlockEncoding({parentHash, height, timestamp, merkleRoot}).
   The canonical block header encoder from src/coding/serialize.ts is reused unchanged, so the same injectivity and validation rules apply: a header with a missing, mistyped, fractional, negative or over-long field throws a CanonicalEncodingError instead of being hashed.
 - proposerPublicKey is ABSENT from the block hash preimage (it therefore encodes as a zero length prefix). The Block interface carries no proposer field and a Uint8Array does not survive JSON.stringify/parse over gossip, so including it would make the hash depend on how a block travelled. Consequence to close later: two blocks that differ only by proposer still have the same block hash.
-- The "blkhash:" prefix is distinct from the "blk:" signing prefix, so a block hash preimage can never coincide with the bytes an ed25519 header signature is made over, nor with a Merkle leaf ("tx:" bytes).
+- The "blkhash:" prefix is distinct from the "blk:" signing prefix, so a block hash preimage can never coincide with the bytes an ed25519 header signature is made over, nor with a Merkle leaf or internal node (which begin with the one-byte tags 0x00 and 0x01, see the Merkle root section).
 - Linkage rule: block N+1 is a child of block N when N+1.height === N.height + 1 AND N+1.parentHash === blockHash(N). src/node.ts enforces exactly this in its gossip "blk" handler, before recomputing the Merkle root and verifying the header signature.
 - Why not the Merkle root: merkleRoot commits to the transaction list and to nothing else. Two blocks with the same transactions but a different height, timestamp or parent share a root, and every empty block shares one (merkleRoot([]) is sha256 of no input), so a child linked by root attached equally well to any of them and a parent's header could be swapped with every descendant still verifying.
 - Compatibility: this is a wire-visible format change. Nodes on the old rule and nodes on this rule will not accept one another's blocks, and any stored chain must be rebuilt from a fresh genesis. No encoding version tag is added because canonicalBlockEncoding itself is unchanged; only what parentHash MEANS changes.
 - Genesis: a genesis block's parentHash is an arbitrary caller-chosen string ("0x00" in tests, "genesis" in examples/run-node.ts); nothing verifies it.
+
+Merkle root (src/merkle.ts)
+- Purpose: the root must be INJECTIVE over the transaction list — different lists must give different roots — because it is the only thing in a block header that commits to the transactions, and the header signature and blockHash commit only to the root.
+- Leaf hash: sha256(0x00 || tx bytes). Internal node: sha256(0x01 || left || right). The one-byte domain tags keep the two spaces apart, so a 64-byte "transaction" cannot be presented as the concatenation of two child hashes.
+- Odd width: the last node of a layer is PROMOTED to the next layer unchanged. It is never hashed against itself.
+- Empty list: the root stays sha256 over no input at all, the value src/block.ts documents and test/block-hash.test.ts relies on. It cannot collide with a real tree, since every non-empty tree is a tagged hash over at least one byte.
+- What this closes: the old code padded an odd layer with `const right = i + 1 < layer.length ? layer[i + 1] : layer[i]`, which made merkleRoot([a, b, c]) equal to merkleRoot([a, b, c, c]). src/node.ts accepts a gossiped block by recomputing the root from blk.transactions and then verifying the ed25519 signature over the HEADER only, so a relay could append a copy of the trailing transaction to an honest block: same recomputed root, same valid proposer signature, same elected proposer key, same blockHash. The node set the padded block as its tip and re-broadcast it, and two nodes then held the same block hash over different transaction lists — a duplicated transfer nobody signed for. Promotion plus the tags removes the collision: the promoted leaf hash of c (tag 0x00) is not the node hash of (c, c) (tag 0x01).
+- Compatibility: this is a wire-visible, breaking format change. Every non-empty block's merkleRoot changes, and so does its blockHash and every header signature over it; nodes on the old rule and nodes on this rule will not accept one another's blocks. Acceptable because no chain is persisted, but any running network must restart from a fresh genesis. No encoding version tag is added: canonicalBlockEncoding is unchanged, only the value of merkleRoot changes.
+
+Files added or changed for the Merkle fix
+- src/merkle.ts (tagged leaf/internal hashing, promotion instead of duplication; merkleLeafHash, merkleNodeHash, MERKLE_LEAF_TAG, MERKLE_NODE_TAG exported for tests)
+- test/merkle.test.ts (the "odd number duplicates last node" test is replaced by promotion, tagging, padded-list inequality and 64-byte second-preimage cases)
+- test/merkle-duplication.test.ts (new: a block built with createBlock, relayed with its last transaction duplicated, is rejected by a Node and leaves the tip unchanged, while the honest block is accepted)
+- SPEC.md (this section)
 
 Validator selection (new)
 - Purpose: a deterministic, stake-weighted selection function is specified so later cycles can choose block proposers for proof-of-stake.
