@@ -3,6 +3,7 @@ import { keypairFromSeed, sign, Keypair } from "../src/crypto/ed25519"
 import { blockHash, createBlock, Block } from "../src/block"
 import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
+import { signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -69,7 +70,9 @@ describe("Node enforces stake-weighted proposer selection", () => {
     await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis)
 
-    const blk = createBlock(blockHash(genesis), 1, [{ sender: "alice", recipient: "bob", amount: 1, nonce: 1 }])
+    const blk = createBlock(blockHash(genesis), 1, [
+      signedTx(12, { recipient: "bob", amount: 1, nonce: 1 }),
+    ])
     const sig = signBlock(blk, signer)
 
     await wait(120)

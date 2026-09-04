@@ -1,6 +1,7 @@
 import { createHash } from "crypto"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, canonicalEncoding } from "./coding/serialize"
+import { transactionSignatureBytes } from "./tx"
 import { Transaction } from "./types/transaction"
 
 export interface Block {
@@ -50,26 +51,57 @@ export function blockHash(block: Block): string {
   return createHash("sha256").update(Buffer.from(preimage)).digest("hex")
 }
 
+/** Domain separator for a signed-transaction Merkle leaf. */
+export const SIGNED_TX_LEAF_PREFIX = "stx:"
+
 /**
- * The bytes hashed as Merkle leaves: the SAME canonical transaction encoding
- * that ed25519 transaction signatures are made over.
+ * One Merkle leaf:
  *
- * JSON.stringify used to produce these bytes, and it is not a canonical form:
+ *   "stx:" || uint16be(len(signature)) || signature || canonicalEncoding(tx)
  *
- *  - it preserves key insertion order, so one logical transaction has two leaf
- *    identities and therefore two Merkle roots;
- *  - it emits null for NaN and Infinity, so a block could commit to
- *    amount: NaN and every node would recompute the same root and accept it;
- *  - it validates nothing and copies unknown fields through verbatim.
+ * The body is the SAME canonical transaction encoding an ed25519 transaction
+ * signature is made over (JSON.stringify is not a canonical form: it preserves
+ * key insertion order, emits null for NaN and Infinity, and copies unknown
+ * fields through untouched), and canonicalEncoding REJECTS what it cannot
+ * represent, so an unencodable transaction never reaches the tree.
  *
- * canonicalEncoding is injective and REJECTS what it cannot represent, so a
- * transaction that is not encodable never reaches the tree at all. A throw here
- * is the caller's signal to refuse the block, never to fall back to raw JSON.
+ * The 64 signature bytes are hashed INTO the leaf, in front of the body and
+ * behind their own length, because the signature is excluded from the signing
+ * preimage: without this a relay could strip a signature, or swap in another
+ * account's, and the recomputed root — and therefore the block hash and the
+ * proposer's header signature — would still match. The "stx:" tag keeps this
+ * preimage distinct from a bare "tx:" signing preimage and from the "blkhash:"
+ * block preimage.
+ *
+ * An unsigned or malformed transaction throws (TransactionSignatureError). A
+ * throw here is the caller's signal to refuse the block, never a fallback.
  */
-export function transactionLeaves(transactions: Transaction[]): Uint8Array[] {
-  return (transactions || []).map((tx) => canonicalEncoding(tx))
+export function transactionLeaf(tx: Transaction): Uint8Array {
+  const signature = transactionSignatureBytes(tx)
+  const body = canonicalEncoding(tx)
+  const prefix = new TextEncoder().encode(SIGNED_TX_LEAF_PREFIX)
+  const out = new Uint8Array(prefix.length + 2 + signature.length + body.length)
+  let off = 0
+  out.set(prefix, off)
+  off += prefix.length
+  out[off++] = (signature.length >> 8) & 0xff
+  out[off++] = signature.length & 0xff
+  out.set(signature, off)
+  off += signature.length
+  out.set(body, off)
+  return out
 }
 
+/** The bytes hashed as Merkle leaves, one per transaction. */
+export function transactionLeaves(transactions: Transaction[]): Uint8Array[] {
+  return (transactions || []).map((tx) => transactionLeaf(tx))
+}
+
+/**
+ * Assemble a block. Every transaction must already be signed: an unsigned or
+ * malformed one throws rather than being committed to, so a node cannot produce
+ * a block its own peers are required to drop.
+ */
 export function createBlock(parentHash: string, height: number, transactions: Transaction[]): Block {
   const txBytes = transactionLeaves(transactions)
   return {
