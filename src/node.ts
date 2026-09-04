@@ -1,5 +1,5 @@
 import { startGossipNode, GossipNode } from "./gossip/ws"
-import { Block, blockHash, createBlock } from "./block"
+import { Block, blockHash, createBlock, transactionLeaves } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
@@ -31,10 +31,22 @@ export class Node {
         // one root); the header hash is unique to the block.
         if (typeof blk.parentHash !== "string" || blk.parentHash !== blockHash(this.tip)) return
 
-        // recompute merkle root from transactions
-        const txBytes: Uint8Array[] = (blk.transactions || []).map((tx: Transaction) => {
-          return new TextEncoder().encode(JSON.stringify(tx))
-        })
+        // recompute merkle root from transactions.
+        //
+        // The leaves are the CANONICAL transaction encoding, the same bytes a
+        // transaction signature is made over — not JSON.stringify, which
+        // preserves key order (one transaction, two roots) and turns NaN and
+        // Infinity into null (a block committing to amount: NaN recomputed to
+        // the same root on every node and was accepted). canonicalEncoding
+        // throws on anything it cannot represent, so a block carrying an
+        // unencodable transaction is DROPPED here: the tip does not move and
+        // nothing is re-broadcast.
+        let txBytes: Uint8Array[]
+        try {
+          txBytes = transactionLeaves((blk.transactions || []) as Transaction[])
+        } catch (e) {
+          return
+        }
         const mr = merkleRoot(txBytes)
         if (mr !== blk.merkleRoot) return
 
