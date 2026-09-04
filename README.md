@@ -1,2 +1,50 @@
 # minichain
 A chain built from scratch in TypeScript - blocks, ed25519 signatures, Merkle roots, PoS, gossip, JSON-RPC.
+
+## Running a node
+
+    npm install
+    npm run dev
+
+`examples/run-node.ts` starts one gossip node and, beside it, the read-only
+JSON-RPC API. Settings (see `.env.example`; values live on the box, never in the
+repository):
+
+- `PORT` — the gossip WebSocket port. Default 9300.
+- `PEERS` — comma-separated `ws://host:port` peers to dial.
+- `VALIDATORS` — the staked set, `hexkey:stake,hexkey:stake`. Unset means any
+  validly signed block is accepted; set means only the stake-elected proposer's.
+- `RPC_PORT` — the JSON-RPC HTTP port. Default 9310, `0` turns it off.
+
+## JSON-RPC (read only)
+
+`src/rpc/server.ts` serves JSON-RPC 2.0 over HTTP on `RPC_PORT`, bound to
+`127.0.0.1`. It is **read only**: it reports what this node knows and offers no
+way to submit a transaction or a block, so the acceptance rules in `src/node.ts`
+remain the only path onto the chain. There is no authentication and no TLS —
+anything beyond loopback belongs behind a reverse proxy.
+
+POST only (any other verb answers 405), request bodies capped at 64 KiB, no
+batch requests.
+
+| method | params | result |
+| --- | --- | --- |
+| `chain_height` | none | `{ height }` |
+| `chain_tip` | none | `{ hash, parentHash, height, timestamp, merkleRoot, transactionCount }` |
+| `chain_getBalance` | `{ account }` or `[account]` | `{ account, balance }` |
+| `chain_getNonce` | `{ account }` or `[account]` | `{ account, nonce }` (`null` if unseen) |
+| `chain_validators` | none | `{ validators, totalStake, enforced }` |
+
+    curl -s http://127.0.0.1:9310 \
+      -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","method":"chain_tip","id":1}'
+
+Errors use the standard codes: `-32700` parse error, `-32600` invalid request,
+`-32601` unknown method, `-32602` invalid params, `-32603` internal error.
+
+## Tests
+
+    npm test
+
+`SPEC.md` records the canonical encodings, the block acceptance rules and this
+RPC surface.

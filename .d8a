@@ -128,12 +128,17 @@ keys:
   PORT
   PEERS
   VALIDATORS
+  RPC_PORT
 
 # How to run this repository. Yours to edit — the governance lines above are
 # not. One terminal per entry, launched together by the ▶ button in VS Code
 # (the VSD8A extension) and by nothing else.
 run:
   {
-    "dev": { "cmd": "npm run dev", "port": 9300 },
+    // One process: the gossip node on PORT (9300) and, beside it, the read-only
+    // JSON-RPC HTTP API on RPC_PORT (9310). The port declared here is 9310
+    // because that is the HTTP surface worth proxying — 9300 is a raw WebSocket
+    // gossip port and answers no HTTP request.
+    "dev": { "cmd": "npm run dev", "port": 9310 },
     "test": { "cmd": "npm test" }
   }
