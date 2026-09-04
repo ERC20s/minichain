@@ -2,7 +2,7 @@ import { MAX_BLOCK_TRANSACTIONS, Node } from "../src/node"
 import { blockHash, createGenesisBlock } from "../src/block"
 import { keypairFromSeed } from "../src/crypto/ed25519"
 import { Validator, publicKeyToHex } from "../src/validators"
-import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, RPC_METHOD_NAMES, startRpcServer } from "../src/rpc/server"
+import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, rpcMethodNames, startRpcServer } from "../src/rpc/server"
 import { MAX_MEMPOOL, MAX_MEMPOOL_PER_SENDER } from "../src/state/mempool"
 
 function parsePeers(env?: string): string[] {
@@ -36,6 +36,50 @@ function parseValidators(env?: string): Validator[] {
       continue
     }
     out.push({ publicKey, stake })
+  }
+  return out
+}
+
+/**
+ * GENESIS_BALANCES is "hexkey:amount,hexkey:amount" — the accounts this node
+ * opens with, handed to the Node as its fifth constructor argument
+ * (src/state/balances.ts, OpeningBalances).
+ *
+ * Why it exists: this chain has no fees, no block reward and no mint
+ * transaction, so a node built with the fixed genesis block (which carries no
+ * transactions) starts with every balance at 0 — and the mempool refuses every
+ * transfer as "unaffordable", so the pool stays empty and the proposer loop
+ * mints nothing for ever. Something has to open the system.
+ *
+ * NOT consensus, and not verified: opening balances are local bookkeeping, so
+ * every node in one network must be given the SAME value or their ledgers
+ * disagree and the network forks at the first transfer. The startup log says so.
+ *
+ * Each key is the lower-case hex of a raw 32-byte ed25519 public key (the same
+ * form a transaction's `sender` takes); each amount a non-negative integer. An
+ * unreadable entry is warned about and skipped rather than silently funding
+ * nobody.
+ */
+function parseGenesisBalances(env?: string): Record<string, number> {
+  const out: Record<string, number> = {}
+  if (!env) return out
+  for (const entry of env.split(",").map(s => s.trim()).filter(Boolean)) {
+    const at = entry.lastIndexOf(":")
+    if (at <= 0) {
+      console.warn(`ignoring GENESIS_BALANCES entry without an amount: ${entry}`)
+      continue
+    }
+    const account = entry.slice(0, at).trim().toLowerCase()
+    const amount = Number(entry.slice(at + 1).trim())
+    if (!/^[0-9a-f]+$/.test(account) || account.length % 2 !== 0) {
+      console.warn(`ignoring GENESIS_BALANCES entry with a non-hex account: ${entry}`)
+      continue
+    }
+    if (!Number.isInteger(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
+      console.warn(`ignoring GENESIS_BALANCES entry with a bad amount: ${entry}`)
+      continue
+    }
+    out[account] = (out[account] || 0) + amount
   }
   return out
 }
@@ -87,10 +131,12 @@ function parseIntervalMs(name: string, raw: string | undefined, fallback: number
 const port = parsePort("PORT", process.env.PORT, 9300)
 const peers = parsePeers(process.env.PEERS)
 const validators = parseValidators(process.env.VALIDATORS)
+const openingBalances = parseGenesisBalances(process.env.GENESIS_BALANCES)
 /**
- * The read-only JSON-RPC surface (src/rpc/server.ts). It binds loopback, so it
- * is a way to ask a node what it knows, never a second way to put a block into
- * it. RPC_PORT=0 disables it.
+ * The JSON-RPC surface (src/rpc/server.ts). It binds loopback, so it is a way to
+ * ask a node what it knows and — through chain_sendTransaction, the one write —
+ * to hand it a signed transaction for its mempool. It is still never a way to
+ * put a BLOCK into the node. RPC_PORT=0 disables it.
  */
 const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
 const proposerSeedBytes = parseProposerSeed(process.env.PROPOSER_KEY)
@@ -112,7 +158,7 @@ const proposeIntervalMs = parseIntervalMs(
  * chain before either of them mints anything.
  */
 const genesis = createGenesisBlock()
-const node = new Node(port, peers, genesis, validators)
+const node = new Node(port, peers, genesis, validators, openingBalances)
 
 console.log(`minichain node started on port ${port}`)
 console.log(`genesis: ${blockHash(genesis)} (height 0, fixed — every node must print this same hash)`)
@@ -129,18 +175,48 @@ console.log(
 )
 
 /**
- * The JSON-RPC surface, started next to the node. Read-only and loopback-bound:
- * it exposes the tip, balances, nonces, the pending-transaction pool and the
- * staked set, and no method on it can submit a transaction or a block, so the
- * acceptance rules in src/node.ts stay the only way into this chain.
+ * Opening balances. Without them every account holds 0, every transfer is
+ * refused "unaffordable" and this chain can never leave height 0 — so the funded
+ * accounts are printed, and so is the warning that they are LOCAL: two nodes
+ * given different GENESIS_BALANCES hold different ledgers and fork at the first
+ * transfer, exactly as two nodes given different VALIDATORS or a different
+ * genesis would.
+ */
+const fundedAccounts = Object.keys(openingBalances)
+if (fundedAccounts.length) {
+  const total = fundedAccounts.reduce((sum, a) => sum + openingBalances[a], 0)
+  console.log(`opening balances: ${fundedAccounts.length} account(s), ${total} in total —`)
+  for (const account of fundedAccounts) {
+    console.log(`  ${account} = ${openingBalances[account]}`)
+  }
+  console.log(
+    "opening balances are LOCAL and unverified: every node in this network must be " +
+      "started with the same GENESIS_BALANCES, or the ledgers disagree and the chain " +
+      "forks at the first transfer"
+  )
+} else {
+  console.log(
+    "opening balances: none (GENESIS_BALANCES unset) — every account holds 0, so every " +
+      "transfer is refused as unaffordable and nothing can be minted"
+  )
+}
+
+/**
+ * The JSON-RPC surface, started next to the node. Loopback-bound: it exposes the
+ * tip, balances, nonces, the pending-transaction pool and the staked set, and —
+ * because this bind is loopback — chain_sendTransaction, which offers a signed
+ * transaction to the same mempool rules a gossiped one goes through. No method
+ * on it can submit a BLOCK, so the acceptance rules in src/node.ts stay the only
+ * way onto this chain.
  */
 const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, DEFAULT_RPC_HOST) : null
 if (rpc) {
   rpc
     .ready()
     .then((bound) => {
-      console.log(`json-rpc listening on http://${DEFAULT_RPC_HOST}:${bound} (POST, read-only)`)
-      console.log(`json-rpc methods: ${RPC_METHOD_NAMES.join(", ")}`)
+      const surface = rpc.writesEnabled ? "POST, reads + chain_sendTransaction" : "POST, read-only"
+      console.log(`json-rpc listening on http://${DEFAULT_RPC_HOST}:${bound} (${surface})`)
+      console.log(`json-rpc methods: ${rpcMethodNames(rpc.writesEnabled).join(", ")}`)
     })
     .catch((err: Error) => {
       console.warn(`json-rpc not started on port ${rpcPort}: ${err.message}`)
