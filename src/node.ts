@@ -517,9 +517,13 @@ export class Node {
    *    signed, so an unelected node never puts a block its peers must drop onto
    *    the wire.
    *  - CONTENT. Up to opts.maxTransactions (default MAX_BLOCK_TRANSACTIONS)
-   *    pending transactions from mempool.take(), which orders them by nonce so
-   *    that each sender's own transactions stage in ascending order. An empty
-   *    pool mints nothing unless opts.allowEmpty.
+   *    pending transactions from mempool.selectForBlock(), which orders them by
+   *    nonce so that each sender's own transactions stage in ascending order AND
+   *    skips any entry that would not stage against the current ledgers. A block
+   *    is judged all-or-nothing, so without that skip a single pending transfer
+   *    its sender can no longer afford would stop this node minting anything, at
+   *    every tick, for ever. A pool that selects nothing mints nothing unless
+   *    opts.allowEmpty.
    *  - STAMP. max(this node's clock, the parent's timestamp), so the block can
    *    never be stamped behind its own parent — the rule acceptBlock enforces.
    *    The clock is the node's injectable `now`, not Date.now.
@@ -548,7 +552,14 @@ export class Node {
         Number.isSafeInteger(opts.maxTransactions) && opts.maxTransactions > 0
           ? opts.maxTransactions
           : MAX_BLOCK_TRANSACTIONS
-      const txs = this.mempool.take(cap)
+      // Filtered, not raw: selectForBlock walks the pool in the same order
+      // take() does but on a working copy of the nonce and balance state, and
+      // SKIPS an entry that would not stage. Without that one pending transfer
+      // whose sender can no longer pay for it makes stage() answer null for the
+      // whole block, at every tick, for ever — and the loop in
+      // examples/run-node.ts reads that null as "nothing to do" and says
+      // nothing. A skipped entry stays pending (see src/state/mempool.ts).
+      const txs = this.mempool.selectForBlock(cap)
       if (txs.length === 0 && !(opts && opts.allowEmpty === true)) return null
 
       // Never behind the parent: acceptBlock refuses a backwards stamp, and a
