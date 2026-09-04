@@ -11,20 +11,25 @@ import {
   RPC_METHOD_NAMES,
   RPC_METHOD_NOT_FOUND,
   RPC_PARSE_ERROR,
+  RPC_WRITE_METHOD_NAMES,
   RpcServerHandle,
+  rpcMethodNames,
   startRpcServer,
 } from "../src/rpc/server"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 /**
- * The read-only JSON-RPC surface (src/rpc/server.ts).
+ * The JSON-RPC surface (src/rpc/server.ts) — its reads, its framing and its
+ * transport. The one write method it serves on loopback has its own file,
+ * test/rpc-submit.test.ts.
  *
  * What is pinned here:
  *  - the answers track the node's own state: height and tip follow an accepted
  *    block, balances and nonces match the ledgers src/node.ts commits;
  *  - the framing is strict JSON-RPC 2.0 and every error code fires;
  *  - the transport is POST-only and body-capped;
- *  - and no call moves the tip, because there is no method that can.
+ *  - and no call moves the tip: the read table writes nothing at all, and the
+ *    single write method reaches the mempool and never a block.
  *
  * The RPC servers bind port 0 (the OS picks a free port), so this file cannot
  * collide with another test file's ports; the two gossip ports it does fix,
@@ -267,7 +272,9 @@ describe("read-only JSON-RPC server", () => {
     const unknown = await call(port, "chain_submitBlock", { block: {} })
     expect(unknown.status).toBe(400)
     expect(unknown.body.error.code).toBe(RPC_METHOD_NOT_FOUND)
-    expect(unknown.body.error.data.methods).toEqual(RPC_METHOD_NAMES)
+    // This server is loopback-bound over a real Node, so the list it advertises
+    // is the reads plus the one write.
+    expect(unknown.body.error.data.methods).toEqual(rpcMethodNames(true))
     expect(unknown.body.id).toBe(1)
   })
 
@@ -324,23 +331,31 @@ describe("read-only JSON-RPC server", () => {
     expect(notification.text).toBe("")
   })
 
-  it("never moves the tip: the surface has no write method", async () => {
+  it("never moves the tip: no method on the surface can submit a block", async () => {
     const before = blockHash(node.tip)
     const balanceBefore = node.balances.balanceOf(accountHex(21))
     const nonceBefore = node.nonces.lastNonce(accountHex(21))
 
     for (const method of RPC_METHOD_NAMES) {
-      // Every method with and without an account argument; none of them writes.
+      // Every read method with and without an account argument; none writes.
       await call(port, method, { account: accountHex(21) })
       await call(port, method)
     }
-    await call(port, "chain_sendTransaction", [{ sender: accountHex(21), amount: 1 }])
+    // The one write, offered an unsigned transaction: the pool refuses it, so
+    // nothing is pooled and nothing on the chain moves either.
+    const unsigned = await call(port, "chain_sendTransaction", [
+      { sender: accountHex(21), recipient: "bob", amount: 1, nonce: 99 },
+    ])
+    expect(unsigned.status).toBe(200)
+    expect(unsigned.body.result.admitted).toBe(false)
+    expect(unsigned.body.result.reason).toBe("unauthorised")
 
     expect(blockHash(node.tip)).toBe(before)
     expect(node.balances.balanceOf(accountHex(21))).toBe(balanceBefore)
     expect(node.nonces.lastNonce(accountHex(21))).toBe(nonceBefore)
-    // The names are the audit: nothing here submits, sends or mines —
-    // chain_mempool reports the pool and cannot add to or drain it.
+    // The names are the audit: the read table holds nothing that submits, sends
+    // or mines, and the write table holds exactly one method — which reaches the
+    // mempool and nothing else. There is still no way to submit a BLOCK.
     expect(RPC_METHOD_NAMES).toEqual([
       "chain_height",
       "chain_tip",
@@ -349,6 +364,7 @@ describe("read-only JSON-RPC server", () => {
       "chain_mempool",
       "chain_validators",
     ])
+    expect(RPC_WRITE_METHOD_NAMES).toEqual(["chain_sendTransaction"])
     expect(node.mempool.size).toBe(0)
   }, 10000)
 

@@ -6,15 +6,20 @@ A chain built from scratch in TypeScript - blocks, ed25519 signatures, Merkle ro
     npm install
     npm run dev
 
-`examples/run-node.ts` starts one gossip node and, beside it, the read-only
-JSON-RPC API. Settings (see `.env.example`; values live on the box, never in the
-repository):
+`examples/run-node.ts` starts one gossip node and, beside it, the JSON-RPC API.
+Settings (see `.env.example`; values live on the box, never in the repository):
 
 - `PORT` — the gossip WebSocket port. Default 9300.
 - `PEERS` — comma-separated `ws://host:port` peers to dial.
 - `VALIDATORS` — the staked set, `hexkey:stake,hexkey:stake`. Unset means any
   validly signed block is accepted; set means only the stake-elected proposer's.
 - `RPC_PORT` — the JSON-RPC HTTP port. Default 9310, `0` turns it off.
+- `GENESIS_BALANCES` — opening balances, `hexkey:amount,hexkey:amount`. There
+  are no fees, no block reward and no mint transaction on this chain, so an
+  unset value means every account holds 0, every transfer is refused as
+  unaffordable and nothing is ever minted. **Local and unverified**: every node
+  in one network must be started with the same value, or the ledgers disagree
+  and the chain forks at the first transfer.
 - `PROPOSER_KEY` — the 64-hex-character ed25519 **seed** this node mints blocks
   with. Unset (the default) means the node follows and relays and mints nothing.
   A secret: it belongs on the box, never in the repository.
@@ -32,8 +37,9 @@ same line. This matters because a child block is linked by
 so two nodes started a millisecond apart had two different chains and each
 silently dropped the other's blocks while sitting at height 0 for ever.
 
-Nodes in one network must also share the same `VALIDATORS` and the same opening
-balances. There is still no history sync: a node started late cannot catch up.
+Nodes in one network must also share the same `VALIDATORS` and the same
+`GENESIS_BALANCES`. There is still no history sync: a node started late cannot
+catch up.
 
 ## Producing blocks
 
@@ -63,16 +69,22 @@ balance covering the amount together with that sender's other pending transfers
 loop around the mesh. The pool is bounded (1024 transactions, 64 per sender),
 held in memory only, and drained of whatever an accepted block committed.
 `Node.submitTransaction(tx)` offers a locally built transaction through the same
-rules. Nothing in this path moves the tip: the pool is local policy, not
+rules, and `chain_sendTransaction` (above) is the door to it from outside the
+process. Nothing in this path moves the tip: the pool is local policy, not
 consensus.
 
-## JSON-RPC (read only)
+End to end, on one funded node: start it with `GENESIS_BALANCES` and
+`PROPOSER_KEY` set, POST a signed transfer to `chain_sendTransaction`, and the
+next proposer tick logs `minted block 1 with 1 transaction(s)` while
+`chain_height` moves off 0.
+
+## JSON-RPC
 
 `src/rpc/server.ts` serves JSON-RPC 2.0 over HTTP on `RPC_PORT`, bound to
-`127.0.0.1`. It is **read only**: it reports what this node knows and offers no
-way to submit a transaction or a block, so the acceptance rules in `src/node.ts`
-remain the only path onto the chain. There is no authentication and no TLS —
-anything beyond loopback belongs behind a reverse proxy.
+`127.0.0.1`. Everything except `chain_sendTransaction` is a pure read. No method
+can submit a **block**, so the acceptance rules in `src/node.ts` remain the only
+path onto the chain. There is no authentication and no TLS — anything beyond
+loopback belongs behind a reverse proxy.
 
 POST only (any other verb answers 405), request bodies capped at 64 KiB, no
 batch requests.
@@ -85,10 +97,31 @@ batch requests.
 | `chain_getNonce` | `{ account }` or `[account]` | `{ account, nonce }` (`null` if unseen) |
 | `chain_mempool` | none | `{ enabled, size, pending, truncated }` (pending transaction ids) |
 | `chain_validators` | none | `{ validators, totalStake, enforced }` |
+| `chain_sendTransaction` **(write, loopback only)** | `{ transaction }` or `[transaction]` | `{ admitted, id, reason }` |
 
     curl -s http://127.0.0.1:9310 \
       -H 'Content-Type: application/json' \
       -d '{"jsonrpc":"2.0","method":"chain_tip","id":1}'
+
+    curl -s http://127.0.0.1:9310 \
+      -H 'Content-Type: application/json' \
+      -d '{"jsonrpc":"2.0","method":"chain_sendTransaction","id":1,
+           "params":{"transaction":{"sender":"<hex pubkey>","recipient":"bob",
+                     "amount":25,"nonce":1,"signature":"<128 hex>"}}}'
+
+`chain_sendTransaction` hands an already-signed transaction to
+`Node.submitTransaction` — the same mempool rules a gossiped `tx` frame passes,
+and the same relay-on-admission — and returns the pool's own answer. A refusal is
+a **result**, not an error: `admitted` is `false` and `reason` is one of
+`unauthorised`, `replayed`, `unaffordable`, `duplicate`, `pool-full`,
+`sender-full`, `malformed`. `id` is the transaction id `chain_mempool` lists. The
+transaction reaches the chain only when the elected proposer mints it.
+
+The write is served **only on a loopback bind** (`127.0.0.0/8`, `::1`,
+`localhost`): widening the bind turns it off — answering `-32601` with
+`data.reason` `not-loopback` — rather than silently opening a write port. A node
+built without `submitTransaction` answers `-32601` with `data.reason`
+`unsupported`.
 
 Errors use the standard codes: `-32700` parse error, `-32600` invalid request,
 `-32601` unknown method, `-32602` invalid params, `-32603` internal error.

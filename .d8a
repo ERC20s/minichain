@@ -131,6 +131,7 @@ keys:
   RPC_PORT
   PROPOSER_KEY
   PROPOSE_INTERVAL_MS
+  GENESIS_BALANCES
 
 # How to run this repository. Yours to edit — the governance lines above are
 # not. One terminal per entry, launched together by the ▶ button in VS Code

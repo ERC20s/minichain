@@ -1,10 +1,13 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from "http"
 import { Socket } from "net"
 import { Block, blockHash } from "../block"
+import { MempoolResult } from "../state/mempool"
+import { Transaction } from "../types/transaction"
 import { Validator } from "../validators"
 
 /**
- * A read-only JSON-RPC 2.0 HTTP surface over a running Node.
+ * A JSON-RPC 2.0 HTTP surface over a running Node: every read this node can
+ * answer, plus ONE write — chain_sendTransaction — served on loopback only.
  *
  * The README and SPEC.md have advertised "JSON-RPC" since the first cycle and
  * nothing in the tree answered a question: eleven cycles hardened what a node
@@ -14,20 +17,27 @@ import { Validator } from "../validators"
  * set — was reachable only from inside the process. A running node printed one
  * line at startup and was otherwise opaque.
  *
- * Two rules shape this module.
+ * Three rules shape this module.
  *
- * READ ONLY. Every method here reads; none of them submits a transaction, a
- * block or a peer. That is deliberate, not an omission: src/node.ts is the ONE
- * place a block is judged, and an RPC that could inject one would be a second,
- * unauthenticated path around those checks. The surface talks to the node
- * through RpcNode below — a handful of read accessors and nothing else, the
- * pending-transaction pool included (size and ids, never add or drop) — so a
- * future write method cannot be added here by accident, only on purpose.
+ * READS ARE FREE, AND THERE IS EXACTLY ONE WRITE. Every method in RPC_METHODS
+ * reads. RPC_WRITE_METHODS holds the single method that does not, and what it
+ * does is deliberately narrow: it hands a SIGNED transaction to
+ * Node.submitTransaction, which is the same pool path a gossiped "tx" frame
+ * takes — the ed25519 transaction signature, a nonce strictly above the sender's
+ * committed nonce, and a balance that covers the amount. It cannot submit a
+ * BLOCK, move the tip or write a ledger: src/node.ts stays the ONE place a block
+ * is judged, and the surface still talks to the node through RpcNode below, so
+ * widening it any further is a visible change in a diff.
  *
- * LOOPBACK BY DEFAULT. The server binds 127.0.0.1 unless a caller passes another
- * host, so starting a node does not put a new port on the public internet. There
- * is no authentication, no TLS and no rate limiting; anything wider than
- * loopback needs a reverse proxy in front of it.
+ * LOOPBACK BY DEFAULT, AND WRITES ONLY THERE. The server binds 127.0.0.1 unless
+ * a caller passes another host, so starting a node does not put a new port on
+ * the public internet. There is no authentication, no TLS and no rate limiting,
+ * so the write method is served ONLY when the bind address is a loopback
+ * address: widening the bind (for a reverse proxy, say) silently turns
+ * chain_sendTransaction off rather than silently opening a write port to the
+ * world. On a non-loopback bind the method answers -32601 with
+ * data.reason "not-loopback"; a node with no submitTransaction answers -32601
+ * with data.reason "unsupported".
  *
  * The transport is Node's built-in http — no new dependency:
  *  - POST only; any other verb answers 405 with an Allow header.
@@ -37,8 +47,9 @@ import { Validator } from "../validators"
  *    arrive, so a lying header cannot make the node buffer megabytes.
  *  - Strict JSON-RPC 2.0 framing: jsonrpc must be exactly "2.0", method must be
  *    a string, id must be a string, a number, null or absent. A request with no
- *    id is a notification: every method is a pure read, so nothing is executed
- *    and the answer is 204 with no body.
+ *    id is a notification: a read has no effect worth running for, so nothing is
+ *    executed, while the write method IS executed (its point is the effect) and
+ *    its answer discarded. Either way the answer is 204 with no body.
  *  - Batch (array) requests are NOT supported in this cycle and are refused as
  *    an invalid request rather than half-handled.
  *  - HTTP status is 200 for a result, 400 for a malformed or unknown call, 405,
@@ -78,9 +89,10 @@ export const RPC_INTERNAL_ERROR = -32603
  * What the RPC surface is allowed to see of a Node.
  *
  * Structural on purpose: a Node satisfies it, and so does a hand-built fixture
- * in a test, but nothing here can reach gossip, broadcastBlock or the ledgers'
- * stage/commit. If a later cycle adds a write method it has to widen THIS
- * interface first, which is a visible change in a diff.
+ * in a test, but nothing here can reach gossip, broadcastBlock, acceptBlock,
+ * proposeBlock or the ledgers' stage/commit. Adding a write method means
+ * widening THIS interface first, which is a visible change in a diff — as
+ * submitTransaction below is.
  */
 export interface RpcNode {
   readonly tip: Block
@@ -96,6 +108,20 @@ export interface RpcNode {
    * chain_mempool answers `enabled: false` for it.
    */
   readonly mempool?: { readonly size: number; ids(): string[] }
+  /**
+   * Offer a signed transaction to this node (Node.submitTransaction).
+   *
+   * The ONLY write this surface has, and it writes nothing itself: the node
+   * applies the ordinary pool rules — signature, nonce, balance, the caps — and
+   * relays only what it admits, so an RPC caller gets exactly what a peer
+   * gossiping the same bytes would get, including the refusal reason. It cannot
+   * touch the tip: a pooled transaction reaches the chain only when an elected
+   * proposer mints it and acceptBlock judges the block.
+   *
+   * OPTIONAL: a fixture without it still satisfies RpcNode, and
+   * chain_sendTransaction answers -32601 (data.reason "unsupported") for it.
+   */
+  readonly submitTransaction?: (tx: Transaction) => MempoolResult
 }
 
 /** The handle startRpcServer returns. */
@@ -104,6 +130,11 @@ export interface RpcServerHandle {
   readonly port: number
   /** The address the server is bound to. */
   readonly host: string
+  /**
+   * Whether this server serves the write method: true only for a loopback bind
+   * of a node that has submitTransaction. The runner logs it.
+   */
+  readonly writesEnabled: boolean
   /** Resolves with the bound port once listening, rejects if the bind fails. */
   ready(): Promise<number>
   /** Stops listening and drops every open connection. */
@@ -192,6 +223,65 @@ function accountParam(params: unknown): string {
   return value
 }
 
+/**
+ * The transaction argument chain_sendTransaction takes, accepted either by name
+ * ({"transaction": {...}}, or "tx"/"signedTransaction" as aliases) or
+ * positionally ([{...}]).
+ *
+ * Shape only: anything that is not a single JSON object is -32602, because it is
+ * the CALLER's mistake. Everything about the transaction itself — the signature,
+ * the sender, the nonce, the amount — is judged by the mempool, whose refusal is
+ * a result, not an error: the caller asked a well-formed question and the answer
+ * is "no, and here is why".
+ */
+function transactionParam(params: unknown): Transaction {
+  let value: unknown
+  if (Array.isArray(params)) {
+    if (params.length !== 1) {
+      throw new RpcError(
+        RPC_INVALID_PARAMS,
+        "expected exactly one positional parameter: the signed transaction"
+      )
+    }
+    value = params[0]
+  } else if (params && typeof params === "object") {
+    const bag = params as Record<string, unknown>
+    value =
+      bag.transaction !== undefined
+        ? bag.transaction
+        : bag.tx !== undefined
+        ? bag.tx
+        : bag.signedTransaction
+  } else {
+    throw new RpcError(
+      RPC_INVALID_PARAMS,
+      'params must be {"transaction": {...}} or [{...}] — a signed transaction object'
+    )
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new RpcError(RPC_INVALID_PARAMS, "transaction must be a JSON object")
+  }
+  return value as Transaction
+}
+
+/**
+ * Is this bind address a loopback address?
+ *
+ * The write method is served only when it is. IPv4 loopback is the whole
+ * 127.0.0.0/8 block, not just 127.0.0.1; "localhost", "::1" (in any spelling,
+ * with or without brackets) and the IPv4-mapped form count too. Anything this
+ * cannot positively recognise — a public address, "0.0.0.0", "::", a hostname —
+ * is NOT loopback, which is the safe direction to be wrong in.
+ */
+export function isLoopbackHost(host: string): boolean {
+  if (typeof host !== "string") return false
+  const h = host.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "")
+  if (h === "localhost") return true
+  if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true
+  if (h === "::ffff:127.0.0.1") return true
+  return /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(h)
+}
+
 /** Methods with no parameters still refuse a parameter they cannot honour. */
 function noParams(params: unknown, method: string): void {
   if (params === undefined || params === null) return
@@ -215,8 +305,9 @@ function describeTip(tip: Block): RpcTip {
 type RpcMethod = (node: RpcNode, params: unknown) => unknown
 
 /**
- * The whole surface. Every entry reads; adding one that writes means changing
- * RpcNode above, which is the point.
+ * The READ surface. Every entry here reads and nothing else — the audit is the
+ * table. A method that writes goes in RPC_WRITE_METHODS below, where the
+ * loopback rule applies to it.
  */
 export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
   /** The height of this node's current tip. */
@@ -282,8 +373,68 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
   },
 })
 
-/** The method names this server answers, for documentation and tests. */
+/** The READ method names, for documentation and tests. */
 export const RPC_METHOD_NAMES: string[] = Object.keys(RPC_METHODS)
+
+/**
+ * The write surface: one method, served only on a loopback bind.
+ *
+ * It is a separate table from RPC_METHODS on purpose. The read table can be
+ * audited at a glance ("nothing here writes") and every write this chain ever
+ * grows has to be added HERE, where the loopback rule and this comment apply to
+ * it. A block is still not submittable by any of them.
+ */
+export const RPC_WRITE_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
+  /**
+   * Offer a SIGNED transaction to this node's mempool, and relay it on
+   * admission — the way in from outside the process.
+   *
+   * Params: {"transaction": {...}} (aliases tx, signedTransaction) or [{...}].
+   * Result: {admitted, id, reason} — the pool's own answer, unedited. A refusal
+   * is a RESULT, not a JSON-RPC error: the call succeeded, the transaction did
+   * not, and `reason` says which rule it failed ("unauthorised", "replayed",
+   * "unaffordable", "duplicate", "pool-full", "sender-full", "malformed").
+   * `id` is the transaction id — hex sha256 of its Merkle leaf, the same id
+   * chain_mempool lists — and is null when the pool could not compute one.
+   *
+   * This is NOT a second consensus path. The transaction is judged by the same
+   * pool rules a gossiped "tx" frame is, the tip does not move, no ledger is
+   * written, and the transaction reaches the chain only if an elected proposer
+   * mints it into a block that acceptBlock then judges like any other.
+   */
+  chain_sendTransaction: (node: RpcNode, params: unknown) => {
+    const tx = transactionParam(params)
+    const submit = node.submitTransaction
+    if (typeof submit !== "function") {
+      throw new RpcError(
+        RPC_METHOD_NOT_FOUND,
+        "this node cannot accept transactions: it has no submitTransaction",
+        { reason: "unsupported" }
+      )
+    }
+    const result = submit.call(node, tx) as MempoolResult
+    if (!result || typeof result !== "object") {
+      throw new RpcError(RPC_INTERNAL_ERROR, "internal error")
+    }
+    return {
+      admitted: result.admitted === true,
+      id: result.id === undefined ? null : result.id,
+      reason: result.reason,
+    }
+  },
+})
+
+/** The WRITE method names. Loopback-only; see isLoopbackHost. */
+export const RPC_WRITE_METHOD_NAMES: string[] = Object.keys(RPC_WRITE_METHODS)
+
+/**
+ * What a server actually answers: the reads always, the writes only when this
+ * bind serves them. Used for the -32601 `data.methods` hint and by the runner's
+ * startup line, so what is advertised is what is served.
+ */
+export function rpcMethodNames(writesEnabled: boolean): string[] {
+  return writesEnabled ? RPC_METHOD_NAMES.concat(RPC_WRITE_METHOD_NAMES) : RPC_METHOD_NAMES.slice()
+}
 
 function sendJson(res: ServerResponse, status: number, body: JsonRpcEnvelope): void {
   const text = JSON.stringify(body)
@@ -303,7 +454,13 @@ function sendJson(res: ServerResponse, status: number, body: JsonRpcEnvelope): v
  * Every failure below answers with a JSON-RPC error object; nothing throws out
  * of here, so a hostile body cannot take the process down with it.
  */
-function respond(node: RpcNode, body: string, res: ServerResponse): void {
+function respond(
+  node: RpcNode,
+  body: string,
+  res: ServerResponse,
+  writesAllowed: boolean,
+  names: string[]
+): void {
   let parsed: unknown
   try {
     parsed = JSON.parse(body)
@@ -365,7 +522,30 @@ function respond(node: RpcNode, body: string, res: ServerResponse): void {
     return
   }
 
-  const method = Object.prototype.hasOwnProperty.call(RPC_METHODS, req.method)
+  const isWrite = Object.prototype.hasOwnProperty.call(RPC_WRITE_METHODS, req.method)
+
+  // A write method on a bind that does not serve writes is refused HERE, with
+  // its own reason, rather than falling through to "unknown method": an operator
+  // who has widened the bind should be told why the call stopped working. (A
+  // node with no submitTransaction is refused by the method itself, with
+  // data.reason "unsupported" — a different failure and a different answer.)
+  if (isWrite && !writesAllowed) {
+    sendJson(
+      res,
+      400,
+      errorEnvelope(
+        id,
+        RPC_METHOD_NOT_FOUND,
+        `${req.method} is served on a loopback bind only`,
+        { methods: names, reason: "not-loopback" }
+      )
+    )
+    return
+  }
+
+  const method = isWrite
+    ? RPC_WRITE_METHODS[req.method]
+    : Object.prototype.hasOwnProperty.call(RPC_METHODS, req.method)
     ? RPC_METHODS[req.method]
     : undefined
   if (!method) {
@@ -373,15 +553,23 @@ function respond(node: RpcNode, body: string, res: ServerResponse): void {
       res,
       400,
       errorEnvelope(id, RPC_METHOD_NOT_FOUND, `unknown method: ${req.method}`, {
-        methods: RPC_METHOD_NAMES,
+        methods: names,
       })
     )
     return
   }
 
-  // A notification asks for no answer. Every method is a pure read, so there is
-  // nothing worth running for its side effects: acknowledge and stop.
+  // A notification asks for no answer. A read has no effect worth running for,
+  // so it is acknowledged without being executed; a WRITE is executed — its
+  // effect is the whole point of the call — and its answer discarded.
   if (isNotification) {
+    if (isWrite) {
+      try {
+        method(node, req.params)
+      } catch (e) {
+        // The caller asked for no answer, so there is nowhere to report this.
+      }
+    }
     if (!res.writableEnded) {
       res.writeHead(204, { "Cache-Control": "no-store" })
       res.end()
@@ -404,7 +592,13 @@ function respond(node: RpcNode, body: string, res: ServerResponse): void {
   }
 }
 
-function handleRequest(node: RpcNode, req: IncomingMessage, res: ServerResponse): void {
+function handleRequest(
+  node: RpcNode,
+  req: IncomingMessage,
+  res: ServerResponse,
+  writesAllowed: boolean,
+  names: string[]
+): void {
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST")
     sendJson(
@@ -464,7 +658,7 @@ function handleRequest(node: RpcNode, req: IncomingMessage, res: ServerResponse)
       return
     }
     try {
-      respond(node, Buffer.concat(chunks).toString("utf8"), res)
+      respond(node, Buffer.concat(chunks).toString("utf8"), res, writesAllowed, names)
     } catch (e) {
       sendJson(res, 500, errorEnvelope(null, RPC_INTERNAL_ERROR, "internal error"))
     }
@@ -477,21 +671,33 @@ function handleRequest(node: RpcNode, req: IncomingMessage, res: ServerResponse)
 }
 
 /**
- * Start the read-only JSON-RPC server for `node`.
+ * Start the JSON-RPC server for `node`.
  *
  * Binds loopback unless `host` says otherwise. Pass port 0 to let the operating
  * system pick a free port and read it back from ready(), which is what the tests
  * do so they never collide with the gossip ports.
+ *
+ * The write method (chain_sendTransaction) is served only when the bind address
+ * is a loopback address AND the node has submitTransaction. The decision is made
+ * once, here, from the host asked for — not per request from a socket's remote
+ * address, which a proxy in front of the server would make meaningless.
  */
 export function startRpcServer(
   node: RpcNode,
   port: number = DEFAULT_RPC_PORT,
   host: string = DEFAULT_RPC_HOST
 ): RpcServerHandle {
+  // Two different things: whether this BIND may serve a write at all, and
+  // whether this node can actually honour one. The first decides -32601
+  // "not-loopback"; the second is the method's own "unsupported" answer. Only
+  // when both hold is chain_sendTransaction advertised.
+  const writesAllowed = isLoopbackHost(host)
+  const writesEnabled = writesAllowed && typeof node.submitTransaction === "function"
+  const names = rpcMethodNames(writesEnabled)
   const sockets: Set<Socket> = new Set()
   const server: Server = createServer((req, res) => {
     try {
-      handleRequest(node, req, res)
+      handleRequest(node, req, res, writesAllowed, names)
     } catch (e) {
       sendJson(res, 500, errorEnvelope(null, RPC_INTERNAL_ERROR, "internal error"))
     }
@@ -534,6 +740,7 @@ export function startRpcServer(
       return bound
     },
     host,
+    writesEnabled,
     ready: () => listening,
     close: () =>
       new Promise<void>((resolve) => {
