@@ -21,6 +21,20 @@ repository):
 - `PROPOSE_INTERVAL_MS` — how often the proposer loop tries to mint. Default
   2000, minimum 100.
 
+## Genesis
+
+Every node starts from the **same** block 0: `createGenesisBlock()`
+(`src/block.ts`) — `parentHash` `"genesis"`, height 0, timestamp **0**, no
+transactions. It is a pure function, so its `blockHash` is identical in every
+process; the runner prints that hash at startup and two terminals must show the
+same line. This matters because a child block is linked by
+`parentHash === blockHash(parent)`: genesis used to be stamped with `Date.now()`,
+so two nodes started a millisecond apart had two different chains and each
+silently dropped the other's blocks while sitting at height 0 for ever.
+
+Nodes in one network must also share the same `VALIDATORS` and the same opening
+balances. There is still no history sync: a node started late cannot catch up.
+
 ## Producing blocks
 
 With `PROPOSER_KEY` set, the runner calls `Node.proposeBlock(secretKey,

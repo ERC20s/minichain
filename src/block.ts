@@ -130,3 +130,45 @@ export function createBlock(
     merkleRoot: merkleRoot(txBytes),
   }
 }
+
+/**
+ * The parentHash of block 0. Genesis has no parent, so this string is a fixed
+ * placeholder rather than a hash of anything: nothing verifies it, but every
+ * node must agree on it, because it is part of the preimage of the genesis
+ * BLOCK HASH that block 1 has to name.
+ */
+export const GENESIS_PARENT_HASH = "genesis"
+
+/**
+ * The timestamp of block 0: the epoch, not "now".
+ *
+ * Genesis is the one block no proposer mints and no peer judges — it is the
+ * agreed starting point every node is constructed with — so it must not depend
+ * on WHEN a node was started. Zero is a non-negative safe integer, so it passes
+ * acceptBlock's timestamp rule as a parent stamp, and every later block (stamped
+ * from a real clock) is trivially not behind it.
+ */
+export const GENESIS_TIMESTAMP = 0
+
+/**
+ * The genesis block — the same bytes, and therefore the same blockHash, in every
+ * process, on every box, at any time.
+ *
+ * Why this exists: createBlock stamps Date.now() when no timestamp is passed and
+ * blockHash covers the timestamp, so `createBlock("genesis", 0, [])` gave two
+ * nodes started a millisecond apart two DIFFERENT genesis hashes. Neither could
+ * ever accept the other's block 1: acceptBlock requires
+ * `blk.parentHash === blockHash(this.tip)`, that comparison failed silently, and
+ * the follower sat at height 0 for ever. The whole gossip, proof-of-stake and
+ * mempool stack could not form a two-node network.
+ *
+ * This is a pure function of its argument. Two calls in two processes, with the
+ * same transactions, produce byte-identical blocks. `transactions` is the opening
+ * state: NonceLedger and BalanceLedger seed from the genesis block a Node is
+ * constructed with (genesis mints; it debits nobody), and nodes in one network
+ * must be constructed with the same list — a different list is a different
+ * merkleRoot and therefore, again, a different chain.
+ */
+export function createGenesisBlock(transactions: Transaction[] = []): Block {
+  return createBlock(GENESIS_PARENT_HASH, 0, transactions, GENESIS_TIMESTAMP)
+}
