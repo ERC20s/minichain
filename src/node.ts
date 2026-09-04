@@ -119,6 +119,17 @@ export class Node {
   syncRequestIntervalMs: number
   /** When this node last sent a "req" frame, on its own clock. */
   private lastSyncRequestAt: number | undefined
+  /**
+   * The FIRST height the outstanding catch-up request asked for, or undefined
+   * when no request is outstanding.
+   *
+   * One "req" is answered with at most MAX_SYNC_BLOCKS blocks, so a node further
+   * behind than that has to ask again once it has applied the batch. This is the
+   * only thing that lets it know a batch it received was FULL — the last height
+   * of the window it asked for (from + MAX_SYNC_BLOCKS - 1) arrived, so there is
+   * very likely more beyond it. See noticeSyncProgress below.
+   */
+  private syncRequestedFrom: number | undefined
 
   constructor(
     port: number,
@@ -155,6 +166,7 @@ export class Node {
         ? interval
         : SYNC_REQUEST_INTERVAL_MS
     this.lastSyncRequestAt = undefined
+    this.syncRequestedFrom = undefined
 
     // pending transactions.
     //
@@ -205,6 +217,12 @@ export class Node {
           this.noticeFutureBlock(blk)
           return
         }
+
+        // The tip moved. If this block was the LAST one of a FULL catch-up
+        // batch, our gap is almost certainly not closed — one request is
+        // answered with at most MAX_SYNC_BLOCKS blocks and nothing used to ask
+        // again, so a node 100 blocks behind stopped dead at 32.
+        this.noticeSyncProgress(blk)
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
@@ -297,6 +315,55 @@ export class Node {
   }
 
   /**
+   * A block we ACCEPTED arrived while a catch-up request was outstanding: if it
+   * completed a full batch, ask for the next one.
+   *
+   * Called only from the "blk" listener, only after acceptBlock() returned true,
+   * so a block this node MINTED itself (proposeBlock calls acceptBlock directly)
+   * can never trigger a request — a proposer is not behind.
+   *
+   * The rule is the arithmetic of the answer. requestSync() asks for
+   * {from, max: MAX_SYNC_BLOCKS} and the responder serves at most
+   * MAX_SYNC_BLOCKS consecutive blocks, so the last height of a FULL batch is
+   * exactly `from + MAX_SYNC_BLOCKS - 1`. Reaching it means the answer was
+   * capped, not exhausted: clear the outstanding marker AND the rate-limit stamp
+   * (32 blocks arrive back to back, far inside syncRequestIntervalMs, so the
+   * limiter would otherwise swallow the follow-up) and ask again from the new
+   * tip. A SHORT batch never reaches that height, so a node that has caught up
+   * stops asking on its own — the chain of requests ends itself.
+   *
+   * A block accepted from OUTSIDE the window the request covered means the
+   * marker is stale (the tip moved on by ordinary gossip); it is cleared without
+   * asking. Never throws.
+   */
+  private noticeSyncProgress(blk: Block): void {
+    try {
+      const from = this.syncRequestedFrom
+      if (from === undefined) return
+      if (!blk || typeof blk !== "object") return
+      if (typeof blk.height !== "number" || !Number.isSafeInteger(blk.height)) return
+
+      const lastOfBatch = from + MAX_SYNC_BLOCKS - 1
+      // Below the window: this request has not been answered yet in any way we
+      // can read. Above it: the marker belongs to a request we have long since
+      // outrun, so drop it rather than re-ask on stale arithmetic.
+      if (blk.height < from) return
+      if (blk.height > lastOfBatch) {
+        this.syncRequestedFrom = undefined
+        return
+      }
+      if (blk.height < lastOfBatch) return
+
+      // A full batch. There is more of the chain past it more often than not.
+      this.syncRequestedFrom = undefined
+      this.lastSyncRequestAt = undefined
+      this.requestSync()
+    } catch (e) {
+      // a catch-up that cannot continue must never break block acceptance
+    }
+  }
+
+  /**
    * Ask peers for the blocks between this node's tip and whatever they hold.
    *
    * Broadcasts one "req" frame naming the FIRST height this node needs
@@ -304,6 +371,11 @@ export class Node {
    * to one request per syncRequestIntervalMs on this node's own (injectable)
    * clock, so a node far behind a busy chain asks once a second rather than once
    * per block it cannot use.
+   *
+   * A request that goes out is REMEMBERED (syncRequestedFrom), because the
+   * answer is capped at MAX_SYNC_BLOCKS blocks: noticeSyncProgress above uses
+   * that height to tell a full batch from a short one and to ask again until the
+   * gap is actually closed.
    *
    * Returns true when a request actually went out. Never throws.
    */
@@ -322,6 +394,8 @@ export class Node {
       const from = this.tip.height + 1
       const payload = new TextEncoder().encode(JSON.stringify({ from, max: MAX_SYNC_BLOCKS }))
       this.gossip.broadcast("req", payload)
+      // Remembered so the batch that answers can be recognised as full.
+      this.syncRequestedFrom = from
       return true
     } catch (e) {
       return false
