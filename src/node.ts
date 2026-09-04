@@ -2,7 +2,7 @@ import { startGossipNode, GossipNode } from "./gossip/ws"
 import { Block, blockHash, createBlock, transactionLeaves } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
-import { verify } from "./crypto/ed25519"
+import { sign, verify } from "./crypto/ed25519"
 import { BalanceLedger, OpeningBalances } from "./state/balances"
 import { Mempool, MempoolOptions, MempoolResult } from "./state/mempool"
 import { NonceLedger } from "./state/nonces"
@@ -19,6 +19,24 @@ import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "./vali
  * the block hash covers the timestamp).
  */
 export const MAX_FUTURE_DRIFT_MS = 120000
+
+/** How many pending transactions a proposed block carries unless told otherwise. */
+export const MAX_BLOCK_TRANSACTIONS = 256
+
+/** Optional knobs for one call to proposeBlock. */
+export interface ProposeOptions {
+  /**
+   * Cap on how many pooled transactions the block carries. Must be a positive
+   * safe integer; anything else leaves MAX_BLOCK_TRANSACTIONS standing.
+   */
+  maxTransactions?: number
+  /**
+   * Mint even with an empty pool. Off by default: an idle chain should not fill
+   * with empty blocks, and every empty block a proposer mints re-rolls the seed
+   * that elects the next one.
+   */
+  allowEmpty?: boolean
+}
 
 /** Optional knobs, mainly so tests can inject a clock and a tighter bound. */
 export interface NodeOptions {
@@ -105,153 +123,20 @@ export class Node {
       }
     })
 
+    // incoming blocks.
+    //
+    // The listener does two things and no more: decode the frame, and hand it to
+    // acceptBlock() — which holds every rule this chain has, in order. A block
+    // is relayed ONLY when it moved this node's tip, exactly as before, and the
+    // bytes relayed are the bytes that arrived: re-encoding could reorder keys,
+    // and the header signature is over the canonical header, not over this JSON.
     this.gossip.on("blk", (m) => {
       try {
         // payload is JSON-encoded Block
         const s = new TextDecoder().decode(m.payload)
         const blk = JSON.parse(s) as Block
 
-        // basic linkage: must be exactly tip.height + 1
-        if (typeof blk.height !== "number" || blk.height !== this.tip.height + 1) return
-        // and must name THIS tip by its block hash. The tip's merkleRoot commits
-        // only to its transactions, so it linked a child equally well to any
-        // block carrying the same transaction list (every empty block shares
-        // one root); the header hash is unique to the block.
-        if (typeof blk.parentHash !== "string" || blk.parentHash !== blockHash(this.tip)) return
-
-        // timestamp bounds.
-        //
-        // Every other header field was checked and this one was only copied
-        // into the header the signature is verified over, so a proposer could
-        // stamp a block with any integer at all. That mattered twice: the
-        // proposer seed for the NEXT height is "pos:" || blockHash(this block),
-        // and blockHash covers the timestamp, so an unbounded stamp is an
-        // unbounded search over who is elected after you; and a block stamped
-        // in the year 3000, or before its own parent, makes the chain's own
-        // ordering meaningless.
-        //
-        // Three cheap checks, run before the Merkle recompute and the
-        // signature work: the stamp must be a real (non-negative, safe)
-        // integer, it must not go BACKWARDS from the tip (equal is allowed —
-        // blocks minted in the same millisecond are ordinary), and it must not
-        // be further ahead of this node's clock than maxFutureDriftMs. A
-        // failing block is dropped exactly like any other: the tip does not
-        // move and nothing is re-broadcast.
-        if (typeof blk.timestamp !== "number" || !Number.isSafeInteger(blk.timestamp)) return
-        if (blk.timestamp < 0) return
-        const parentStamp = this.tip ? this.tip.timestamp : 0
-        if (typeof parentStamp === "number" && Number.isFinite(parentStamp)) {
-          if (blk.timestamp < parentStamp) return
-        }
-        if (blk.timestamp > this.now() + this.maxFutureDriftMs) return
-
-        // recompute merkle root from transactions.
-        //
-        // The leaves are the CANONICAL transaction encoding, the same bytes a
-        // transaction signature is made over — not JSON.stringify, which
-        // preserves key order (one transaction, two roots) and turns NaN and
-        // Infinity into null (a block committing to amount: NaN recomputed to
-        // the same root on every node and was accepted). canonicalEncoding
-        // throws on anything it cannot represent, so a block carrying an
-        // unencodable transaction is DROPPED here: the tip does not move and
-        // nothing is re-broadcast.
-        const txs = (blk.transactions || []) as Transaction[]
-        let txBytes: Uint8Array[]
-        try {
-          txBytes = transactionLeaves(txs)
-        } catch (e) {
-          return
-        }
-        const mr = merkleRoot(txBytes)
-        if (mr !== blk.merkleRoot) return
-
-        // per-transaction authorisation.
-        //
-        // The root above proves the block commits to exactly these transactions
-        // and the header signature below proves WHO proposed the block — neither
-        // says the sender agreed to be debited. Without this check an elected
-        // proposer could mint {sender: "alice", recipient: "me", amount: 1e6}
-        // and every node would accept and relay it. Each transaction must carry
-        // an ed25519 signature that verifies against the public key its own
-        // `sender` field names; one failure drops the whole block, so the tip
-        // does not move and nothing is re-broadcast.
-        for (const tx of txs) {
-          if (!verifyTransaction(tx)) return
-        }
-
-        // replay protection.
-        //
-        // A signature proves the sender consented to THESE bytes; it never
-        // expires, so the identical signed object verifies for ever. Without the
-        // check below a proposer could put an already-accepted transaction into
-        // the next block, or the same one twice into this one, and every check
-        // above still passed — same leaves, same root, same header signature,
-        // same elected proposer — so the transfer happened again.
-        //
-        // Each sender's nonce must be STRICTLY greater than the last one this
-        // node accepted for it, counting transactions earlier in the same block.
-        // Staging touches no state: the ledger is written only at the accept
-        // point below, so a block dropped by the header-signature or proposer
-        // check cannot burn nonces the chain never spent.
-        const staged = this.nonces.stage(txs)
-        if (staged === null) return
-
-        // solvency.
-        //
-        // The checks above prove the block commits to these transactions, that
-        // each sender consented to its own, and that none of them is a replay.
-        // None of them proves the money exists: an elected proposer could sign a
-        // fresh, correctly nonced transfer of 1e15 from an account that has
-        // never been credited and every check so far still passed, so the tip
-        // moved and the node relayed value created out of nothing.
-        //
-        // Each sender's running balance — genesis mints plus whatever it has
-        // received, minus what it has spent, counting transactions earlier in
-        // this same block — must cover the amount. One overdraft drops the WHOLE
-        // block. Staging touches no state; the ledger is written only at the
-        // accept point below, so a block dropped by the header-signature or
-        // proposer check cannot spend balances the chain never spent.
-        const stagedBalances = this.balances.stage(txs)
-        if (stagedBalances === null) return
-
-        // require signature and pubKey
-        if (!m.sig || !m.pubKey) return
-
-        const header: CanonicalBlockHeader = {
-          parentHash: blk.parentHash,
-          height: blk.height,
-          timestamp: blk.timestamp,
-          merkleRoot: blk.merkleRoot,
-          proposerPublicKey: m.pubKey,
-        }
-        const msg = canonicalBlockEncoding(header)
-        const ok = verify(msg, m.sig, m.pubKey)
-        if (!ok) return
-
-        // proof of stake: a valid signature only proves WHO signed the block,
-        // not that they were entitled to propose it. When this node is
-        // configured with a validator set, the signer must be the validator the
-        // stake-weighted selector elects for this height — the seed being the
-        // CURRENT tip's block hash, so the check runs before this.tip moves and
-        // before anything is re-broadcast to peers.
-        if (this.validators.length > 0) {
-          const elected = selectValidator(this.validators, proposerSeed(this.tip))
-          // A set that yields no proposer (all stakes zero, a malformed entry)
-          // elects nobody, so nothing extends the chain: failing closed here is
-          // safer than falling back to "any signature will do".
-          if (elected === null) return
-          if (elected.toLowerCase() !== publicKeyToHex(m.pubKey)) return
-        }
-
-        // accept block: the tip moves and the nonces and balances this block
-        // spent are written together, so the three can never disagree.
-        this.tip = blk
-        this.nonces.commit(staged)
-        this.balances.commit(stagedBalances)
-        // and the pool forgets what this block committed, plus anything the new
-        // nonces just made impossible. Run after the commits, so it reads the
-        // ledgers at the new tip.
-        this.mempool.drop(txs)
+        if (!this.acceptBlock(blk, m.sig, m.pubKey)) return
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
@@ -259,6 +144,257 @@ export class Node {
         // ignore malformed
       }
     })
+  }
+
+  /**
+   * Judge a block against every rule this chain has and, if it passes, make it
+   * the tip.
+   *
+   * This is the ONE acceptance path. It used to be the body of the gossip "blk"
+   * listener; it is a method so that a block this node MINTS (proposeBlock
+   * below) is judged by exactly the same code, in exactly the same order, as a
+   * block off the wire — a self-minted block that fails our own rules is never
+   * broadcast, and there is no local shortcut into the chain.
+   *
+   * Returns true only when the tip moved. It never throws and it never
+   * broadcasts: relaying is the caller's business, precisely because a caller
+   * that has the original bytes should relay those bytes.
+   */
+  acceptBlock(blk: Block, sig?: Uint8Array, pubKey?: Uint8Array): boolean {
+    try {
+      if (!blk || typeof blk !== "object") return false
+
+      // basic linkage: must be exactly tip.height + 1
+      if (typeof blk.height !== "number" || blk.height !== this.tip.height + 1) return false
+      // and must name THIS tip by its block hash. The tip's merkleRoot commits
+      // only to its transactions, so it linked a child equally well to any
+      // block carrying the same transaction list (every empty block shares
+      // one root); the header hash is unique to the block.
+      if (typeof blk.parentHash !== "string" || blk.parentHash !== blockHash(this.tip)) return false
+
+      // timestamp bounds.
+      //
+      // Every other header field was checked and this one was only copied
+      // into the header the signature is verified over, so a proposer could
+      // stamp a block with any integer at all. That mattered twice: the
+      // proposer seed for the NEXT height is "pos:" || blockHash(this block),
+      // and blockHash covers the timestamp, so an unbounded stamp is an
+      // unbounded search over who is elected after you; and a block stamped
+      // in the year 3000, or before its own parent, makes the chain's own
+      // ordering meaningless.
+      //
+      // Three cheap checks, run before the Merkle recompute and the
+      // signature work: the stamp must be a real (non-negative, safe)
+      // integer, it must not go BACKWARDS from the tip (equal is allowed —
+      // blocks minted in the same millisecond are ordinary), and it must not
+      // be further ahead of this node's clock than maxFutureDriftMs. A
+      // failing block is dropped exactly like any other: the tip does not
+      // move and nothing is re-broadcast.
+      if (typeof blk.timestamp !== "number" || !Number.isSafeInteger(blk.timestamp)) return false
+      if (blk.timestamp < 0) return false
+      const parentStamp = this.tip ? this.tip.timestamp : 0
+      if (typeof parentStamp === "number" && Number.isFinite(parentStamp)) {
+        if (blk.timestamp < parentStamp) return false
+      }
+      if (blk.timestamp > this.now() + this.maxFutureDriftMs) return false
+
+      // recompute merkle root from transactions.
+      //
+      // The leaves are the CANONICAL transaction encoding, the same bytes a
+      // transaction signature is made over — not JSON.stringify, which
+      // preserves key order (one transaction, two roots) and turns NaN and
+      // Infinity into null (a block committing to amount: NaN recomputed to
+      // the same root on every node and was accepted). canonicalEncoding
+      // throws on anything it cannot represent, so a block carrying an
+      // unencodable transaction is DROPPED here: the tip does not move and
+      // nothing is re-broadcast.
+      const txs = (blk.transactions || []) as Transaction[]
+      let txBytes: Uint8Array[]
+      try {
+        txBytes = transactionLeaves(txs)
+      } catch (e) {
+        return false
+      }
+      const mr = merkleRoot(txBytes)
+      if (mr !== blk.merkleRoot) return false
+
+      // per-transaction authorisation.
+      //
+      // The root above proves the block commits to exactly these transactions
+      // and the header signature below proves WHO proposed the block — neither
+      // says the sender agreed to be debited. Without this check an elected
+      // proposer could mint {sender: "alice", recipient: "me", amount: 1e6}
+      // and every node would accept and relay it. Each transaction must carry
+      // an ed25519 signature that verifies against the public key its own
+      // `sender` field names; one failure drops the whole block, so the tip
+      // does not move and nothing is re-broadcast.
+      for (const tx of txs) {
+        if (!verifyTransaction(tx)) return false
+      }
+
+      // replay protection.
+      //
+      // A signature proves the sender consented to THESE bytes; it never
+      // expires, so the identical signed object verifies for ever. Without the
+      // check below a proposer could put an already-accepted transaction into
+      // the next block, or the same one twice into this one, and every check
+      // above still passed — same leaves, same root, same header signature,
+      // same elected proposer — so the transfer happened again.
+      //
+      // Each sender's nonce must be STRICTLY greater than the last one this
+      // node accepted for it, counting transactions earlier in the same block.
+      // Staging touches no state: the ledger is written only at the accept
+      // point below, so a block dropped by the header-signature or proposer
+      // check cannot burn nonces the chain never spent.
+      const staged = this.nonces.stage(txs)
+      if (staged === null) return false
+
+      // solvency.
+      //
+      // The checks above prove the block commits to these transactions, that
+      // each sender consented to its own, and that none of them is a replay.
+      // None of them proves the money exists: an elected proposer could sign a
+      // fresh, correctly nonced transfer of 1e15 from an account that has
+      // never been credited and every check so far still passed, so the tip
+      // moved and the node relayed value created out of nothing.
+      //
+      // Each sender's running balance — genesis mints plus whatever it has
+      // received, minus what it has spent, counting transactions earlier in
+      // this same block — must cover the amount. One overdraft drops the WHOLE
+      // block. Staging touches no state; the ledger is written only at the
+      // accept point below, so a block dropped by the header-signature or
+      // proposer check cannot spend balances the chain never spent.
+      const stagedBalances = this.balances.stage(txs)
+      if (stagedBalances === null) return false
+
+      // require signature and pubKey
+      if (!sig || !pubKey) return false
+
+      const header: CanonicalBlockHeader = {
+        parentHash: blk.parentHash,
+        height: blk.height,
+        timestamp: blk.timestamp,
+        merkleRoot: blk.merkleRoot,
+        proposerPublicKey: pubKey,
+      }
+      const msg = canonicalBlockEncoding(header)
+      const ok = verify(msg, sig, pubKey)
+      if (!ok) return false
+
+      // proof of stake: a valid signature only proves WHO signed the block,
+      // not that they were entitled to propose it. When this node is
+      // configured with a validator set, the signer must be the validator the
+      // stake-weighted selector elects for this height — the seed being the
+      // CURRENT tip's block hash, so the check runs before this.tip moves and
+      // before anything is re-broadcast to peers.
+      if (this.validators.length > 0) {
+        const elected = selectValidator(this.validators, proposerSeed(this.tip))
+        // A set that yields no proposer (all stakes zero, a malformed entry)
+        // elects nobody, so nothing extends the chain: failing closed here is
+        // safer than falling back to "any signature will do".
+        if (elected === null) return false
+        if (elected.toLowerCase() !== publicKeyToHex(pubKey)) return false
+      }
+
+      // accept block: the tip moves and the nonces and balances this block
+      // spent are written together, so the three can never disagree.
+      this.tip = blk
+      this.nonces.commit(staged)
+      this.balances.commit(stagedBalances)
+      // and the pool forgets what this block committed, plus anything the new
+      // nonces just made impossible. Run after the commits, so it reads the
+      // ledgers at the new tip.
+      this.mempool.drop(txs)
+      return true
+    } catch (e) {
+      // ignore malformed
+      return false
+    }
+  }
+
+  /**
+   * Mint the next block from this node's own mempool, and gossip it.
+   *
+   * This is the first thing on this chain that PRODUCES a block. Thirteen cycles
+   * hardened what a node accepts; nothing minted, so a transfer that reached the
+   * pool stayed there for ever and `npm run dev` ran a chain whose height never
+   * left 0.
+   *
+   * What it does, in order:
+   *
+   *  - ELECTION FIRST. When this node is configured with a validator set, the
+   *    key offered here must be the validator selectValidator elects for the
+   *    seed of the CURRENT tip ("pos:" || blockHash(tip), src/validators.ts).
+   *    Not elected — or a set that elects nobody — means null, and nothing is
+   *    signed, so an unelected node never puts a block its peers must drop onto
+   *    the wire.
+   *  - CONTENT. Up to opts.maxTransactions (default MAX_BLOCK_TRANSACTIONS)
+   *    pending transactions from mempool.take(), which orders them by nonce so
+   *    that each sender's own transactions stage in ascending order. An empty
+   *    pool mints nothing unless opts.allowEmpty.
+   *  - STAMP. max(this node's clock, the parent's timestamp), so the block can
+   *    never be stamped behind its own parent — the rule acceptBlock enforces.
+   *    The clock is the node's injectable `now`, not Date.now.
+   *  - SELF-JUDGEMENT. The finished block goes through acceptBlock() like any
+   *    other. Only if THIS node accepts it — linkage, timestamp, Merkle root,
+   *    every transaction signature, nonces, balances, the header signature and
+   *    the proposer check — is it broadcast. A block we would refuse from a peer
+   *    is never one we send to a peer.
+   *
+   * Returns the accepted block, or null when nothing was minted. Never throws.
+   */
+  proposeBlock(secretKey: Uint8Array, publicKey: Uint8Array, opts?: ProposeOptions): Block | null {
+    try {
+      if (!(secretKey instanceof Uint8Array) || !(publicKey instanceof Uint8Array)) return null
+
+      // Elected? Checked before any work, and against the same seed acceptBlock
+      // will use, because the tip cannot move underneath a synchronous call.
+      if (this.validators.length > 0) {
+        const elected = selectValidator(this.validators, proposerSeed(this.tip))
+        if (elected === null) return null
+        if (elected.toLowerCase() !== publicKeyToHex(publicKey)) return null
+      }
+
+      const cap =
+        opts && typeof opts.maxTransactions === "number" &&
+        Number.isSafeInteger(opts.maxTransactions) && opts.maxTransactions > 0
+          ? opts.maxTransactions
+          : MAX_BLOCK_TRANSACTIONS
+      const txs = this.mempool.take(cap)
+      if (txs.length === 0 && !(opts && opts.allowEmpty === true)) return null
+
+      // Never behind the parent: acceptBlock refuses a backwards stamp, and a
+      // proposer whose box is a second slow would otherwise mint a block only it
+      // believes in.
+      const clock = this.now()
+      const base = typeof clock === "number" && Number.isFinite(clock) ? Math.floor(clock) : Date.now()
+      const parentStamp =
+        this.tip && typeof this.tip.timestamp === "number" && Number.isSafeInteger(this.tip.timestamp)
+          ? this.tip.timestamp
+          : 0
+      const timestamp = Math.max(base, parentStamp)
+
+      // Throws for an unencodable or unsigned transaction; a pooled transaction
+      // is neither, but a proposer must not die on one.
+      const blk = createBlock(blockHash(this.tip), this.tip.height + 1, txs, timestamp)
+
+      const header: CanonicalBlockHeader = {
+        parentHash: blk.parentHash,
+        height: blk.height,
+        timestamp: blk.timestamp,
+        merkleRoot: blk.merkleRoot,
+        proposerPublicKey: publicKey,
+      }
+      const signature = sign(canonicalBlockEncoding(header), secretKey)
+
+      // Our own rules, on our own block, before anyone else sees it.
+      if (!this.acceptBlock(blk, signature, publicKey)) return null
+
+      this.broadcastBlock(blk, signature, publicKey)
+      return blk
+    } catch (e) {
+      return null
+    }
   }
 
   /**
