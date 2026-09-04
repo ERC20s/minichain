@@ -15,6 +15,29 @@ repository):
 - `VALIDATORS` — the staked set, `hexkey:stake,hexkey:stake`. Unset means any
   validly signed block is accepted; set means only the stake-elected proposer's.
 - `RPC_PORT` — the JSON-RPC HTTP port. Default 9310, `0` turns it off.
+- `PROPOSER_KEY` — the 64-hex-character ed25519 **seed** this node mints blocks
+  with. Unset (the default) means the node follows and relays and mints nothing.
+  A secret: it belongs on the box, never in the repository.
+- `PROPOSE_INTERVAL_MS` — how often the proposer loop tries to mint. Default
+  2000, minimum 100.
+
+## Producing blocks
+
+With `PROPOSER_KEY` set, the runner calls `Node.proposeBlock(secretKey,
+publicKey)` on a timer. One tick:
+
+- refuses immediately unless this key is the stake-elected proposer for the
+  current tip (`selectValidator(validators, proposerSeed(tip))`), when a
+  validator set is configured;
+- takes up to 256 pending transactions from the mempool, in nonce order;
+- mints nothing at all when the pool is empty (pass `{ allowEmpty: true }` to
+  override), so an idle chain does not fill with empty blocks;
+- stamps the block with `max(this node's clock, the parent's timestamp)`;
+- signs the header and puts the block through `Node.acceptBlock` — the same and
+  only acceptance path a gossiped block takes — and gossips it only if this node
+  accepts it. A block we would refuse from a peer is never sent to a peer.
+
+There is still no fork choice: a proposer only ever extends the tip it holds.
 
 ## Pending transactions
 

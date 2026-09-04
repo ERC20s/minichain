@@ -1,6 +1,7 @@
-import { Node } from "../src/node"
+import { MAX_BLOCK_TRANSACTIONS, Node } from "../src/node"
 import { createBlock } from "../src/block"
-import { Validator } from "../src/validators"
+import { keypairFromSeed } from "../src/crypto/ed25519"
+import { Validator, publicKeyToHex } from "../src/validators"
 import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, RPC_METHOD_NAMES, startRpcServer } from "../src/rpc/server"
 import { MAX_MEMPOOL, MAX_MEMPOOL_PER_SENDER } from "../src/state/mempool"
 
@@ -53,6 +54,36 @@ function parsePort(name: string, raw: string | undefined, fallback: number): num
   return value
 }
 
+/**
+ * PROPOSER_KEY is the 64-hex-character (32 byte) ed25519 SEED this node mints
+ * with. Set it and the node runs a proposer loop; leave it unset and the node
+ * keeps today's follower-only behaviour, accepting and relaying blocks and
+ * minting none. It is a secret: it belongs in the environment, never in the
+ * repository.
+ */
+function parseProposerSeed(raw?: string): Uint8Array | null {
+  if (raw === undefined || raw.trim() === "") return null
+  const hex = raw.trim().toLowerCase()
+  if (!/^[0-9a-f]{64}$/.test(hex)) {
+    console.warn("ignoring PROPOSER_KEY: expected 64 hex characters (a 32-byte ed25519 seed)")
+    return null
+  }
+  return Uint8Array.from(Buffer.from(hex, "hex"))
+}
+
+/** How often the proposer loop tries to mint, in milliseconds. */
+export const DEFAULT_PROPOSE_INTERVAL_MS = 2000
+
+function parseIntervalMs(name: string, raw: string | undefined, fallback: number): number {
+  if (raw === undefined || raw.trim() === "") return fallback
+  const value = parseInt(raw, 10)
+  if (!Number.isInteger(value) || value < 100) {
+    console.warn(`ignoring ${name}=${raw}: not a millisecond interval of 100 or more, using ${fallback}`)
+    return fallback
+  }
+  return value
+}
+
 const port = parsePort("PORT", process.env.PORT, 9300)
 const peers = parsePeers(process.env.PEERS)
 const validators = parseValidators(process.env.VALIDATORS)
@@ -62,6 +93,12 @@ const validators = parseValidators(process.env.VALIDATORS)
  * it. RPC_PORT=0 disables it.
  */
 const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
+const proposerSeedBytes = parseProposerSeed(process.env.PROPOSER_KEY)
+const proposeIntervalMs = parseIntervalMs(
+  "PROPOSE_INTERVAL_MS",
+  process.env.PROPOSE_INTERVAL_MS,
+  DEFAULT_PROPOSE_INTERVAL_MS
+)
 
 const genesis = createBlock("genesis", 0, [])
 const node = new Node(port, peers, genesis, validators)
@@ -100,8 +137,54 @@ if (rpc) {
   console.log("json-rpc: disabled (RPC_PORT=0)")
 }
 
+/**
+ * Block production.
+ *
+ * With PROPOSER_KEY set, this node tries to mint every PROPOSE_INTERVAL_MS
+ * milliseconds: Node.proposeBlock takes up to MAX_BLOCK_TRANSACTIONS pending
+ * transactions, refuses if this key is not the stake-elected proposer for the
+ * current tip, judges its own block by the ordinary acceptance rules and only
+ * then gossips it. A tick with an empty pool mints nothing — an idle chain does
+ * not fill with empty blocks — so a null answer is the normal, quiet case and is
+ * not logged.
+ */
+const proposer = proposerSeedBytes ? keypairFromSeed(proposerSeedBytes) : null
+let proposeTimer: ReturnType<typeof setInterval> | null = null
+
+if (proposer) {
+  const hex = publicKeyToHex(proposer.publicKey)
+  console.log(
+    `proposer: enabled as ${hex} — minting every ${proposeIntervalMs}ms, ` +
+      `up to ${MAX_BLOCK_TRANSACTIONS} transactions per block`
+  )
+  if (validators.length && !validators.some((v) => v.publicKey === hex)) {
+    console.warn(
+      "proposer: this key is not in VALIDATORS — it can never be elected, so this node will mint nothing"
+    )
+  }
+  proposeTimer = setInterval(() => {
+    try {
+      const blk = node.proposeBlock(proposer.secretKey, proposer.publicKey)
+      if (blk) {
+        console.log(
+          `minted block ${blk.height} with ${blk.transactions.length} transaction(s), ` +
+            `merkleRoot ${blk.merkleRoot.slice(0, 16)}…`
+        )
+      }
+    } catch (err) {
+      console.warn(`propose failed: ${(err as Error).message}`)
+    }
+  }, proposeIntervalMs)
+} else {
+  console.log("proposer: disabled (PROPOSER_KEY unset) — this node follows and relays, and mints nothing")
+}
+
 function shutdown() {
   console.log("shutting down")
+  if (proposeTimer) {
+    clearInterval(proposeTimer)
+    proposeTimer = null
+  }
   try { node.close() } catch (e) {}
   if (rpc) {
     // Stop listening before the process goes, so a restart can rebind the port.

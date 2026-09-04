@@ -101,13 +101,31 @@ export function transactionLeaves(transactions: Transaction[]): Uint8Array[] {
  * Assemble a block. Every transaction must already be signed: an unsigned or
  * malformed one throws rather than being committed to, so a node cannot produce
  * a block its own peers are required to drop.
+ *
+ * `timestamp` is optional. Left out, the block is stamped with Date.now(), which
+ * is what genesis and the tests have always wanted. A proposer passes it: a Node
+ * carries an INJECTABLE clock (NodeOptions.now, src/node.ts) and judges an
+ * incoming stamp against that clock and against its parent's stamp, so a block
+ * this node mints has to be stamped from the same clock — otherwise a test that
+ * moves `now` would mint blocks its own node refuses. Anything that is not a
+ * non-negative safe integer falls back to Date.now() rather than putting NaN or
+ * a fraction into a header the block hash covers.
  */
-export function createBlock(parentHash: string, height: number, transactions: Transaction[]): Block {
+export function createBlock(
+  parentHash: string,
+  height: number,
+  transactions: Transaction[],
+  timestamp?: number
+): Block {
   const txBytes = transactionLeaves(transactions)
+  const stamped =
+    typeof timestamp === "number" && Number.isSafeInteger(timestamp) && timestamp >= 0
+      ? timestamp
+      : Date.now()
   return {
     parentHash,
     height,
-    timestamp: Date.now(),
+    timestamp: stamped,
     transactions,
     merkleRoot: merkleRoot(txBytes),
   }
