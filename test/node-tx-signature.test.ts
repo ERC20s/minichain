@@ -5,7 +5,7 @@ import { merkleRoot } from "../src/merkle"
 import { Node } from "../src/node"
 import { signTransaction, verifyTransaction } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
-import { account, accountHex, signedTx } from "./helpers/signed-tx"
+import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -77,9 +77,12 @@ describe("a node refuses a block carrying an unauthorised transaction", () => {
 
   async function deliver(blk: Block, ports: [number, number]) {
     const [portA, portB] = ports
-    const nodeB = new Node(portB, [], genesis)
+    // the honest senders are funded, so a block that is dropped below is
+    // dropped for the signature, never for insolvency
+    const opening = funded([62, 64])
+    const nodeB = new Node(portB, [], genesis, [], opening)
     await wait(60)
-    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis)
+    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
     const sig = signBlock(blk, proposer) // a genuine header signature
     await wait(100)

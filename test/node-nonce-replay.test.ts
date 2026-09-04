@@ -5,7 +5,7 @@ import { Node } from "../src/node"
 import { NonceLedger } from "../src/state/nonces"
 import { verifyTransaction } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
-import { account, accountHex, signedTx } from "./helpers/signed-tx"
+import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -126,9 +126,12 @@ describe("a node drops a block that replays a transaction", () => {
   /** Two connected nodes; blocks are delivered to B one after another. */
   async function session(ports: [number, number]) {
     const [portA, portB] = ports
-    const nodeB = new Node(portB, [], genesis)
+    // both senders are funded, so every block below is judged on its nonces
+    // and not on whether its transfers are affordable
+    const opening = funded([74, 75])
+    const nodeB = new Node(portB, [], genesis, [], opening)
     await wait(60)
-    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis)
+    const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
     await wait(100)
     return {
       tip: () => nodeB.tip,

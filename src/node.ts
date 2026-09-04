@@ -3,6 +3,7 @@ import { Block, blockHash, createBlock, transactionLeaves } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
+import { BalanceLedger, OpeningBalances } from "./state/balances"
 import { NonceLedger } from "./state/nonces"
 import { verifyTransaction } from "./tx"
 import { Transaction } from "./types/transaction"
@@ -18,12 +19,26 @@ export class Node {
    * transfer was authorised; this is the only thing that proves it is fresh.
    */
   nonces: NonceLedger
+  /**
+   * Balance per account, seeded from genesis (which mints) and from any opening
+   * balances this node was constructed with. A signature proves a transfer was
+   * authorised and the nonce proves it is fresh; this is the only thing that
+   * proves it is affordable.
+   */
+  balances: BalanceLedger
 
-  constructor(port: number, peers: string[], genesis: Block, validators: Validator[] = []) {
+  constructor(
+    port: number,
+    peers: string[],
+    genesis: Block,
+    validators: Validator[] = [],
+    openingBalances?: OpeningBalances
+  ) {
     this.gossip = startGossipNode(port, peers)
     this.tip = genesis
     this.validators = Array.isArray(validators) ? validators : []
     this.nonces = new NonceLedger(genesis ? genesis.transactions : [])
+    this.balances = new BalanceLedger(genesis ? genesis.transactions : [], openingBalances)
 
     this.gossip.on("blk", (m) => {
       try {
@@ -90,6 +105,24 @@ export class Node {
         const staged = this.nonces.stage(txs)
         if (staged === null) return
 
+        // solvency.
+        //
+        // The checks above prove the block commits to these transactions, that
+        // each sender consented to its own, and that none of them is a replay.
+        // None of them proves the money exists: an elected proposer could sign a
+        // fresh, correctly nonced transfer of 1e15 from an account that has
+        // never been credited and every check so far still passed, so the tip
+        // moved and the node relayed value created out of nothing.
+        //
+        // Each sender's running balance — genesis mints plus whatever it has
+        // received, minus what it has spent, counting transactions earlier in
+        // this same block — must cover the amount. One overdraft drops the WHOLE
+        // block. Staging touches no state; the ledger is written only at the
+        // accept point below, so a block dropped by the header-signature or
+        // proposer check cannot spend balances the chain never spent.
+        const stagedBalances = this.balances.stage(txs)
+        if (stagedBalances === null) return
+
         // require signature and pubKey
         if (!m.sig || !m.pubKey) return
 
@@ -119,10 +152,11 @@ export class Node {
           if (elected.toLowerCase() !== publicKeyToHex(m.pubKey)) return
         }
 
-        // accept block: the tip moves and the nonces this block spent are
-        // written together, so the two can never disagree.
+        // accept block: the tip moves and the nonces and balances this block
+        // spent are written together, so the three can never disagree.
         this.tip = blk
         this.nonces.commit(staged)
+        this.balances.commit(stagedBalances)
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
