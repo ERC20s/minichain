@@ -17,14 +17,47 @@ type MsgEnvelope = {
   pubKeyHex?: string
 }
 
+/**
+ * The frame types this transport carries.
+ *
+ *  - "tx"  a signed transaction, for the mempool.
+ *  - "blk" a block with its header signature and proposer key.
+ *  - "req" a request for missing blocks: the payload is
+ *          {"from": <height>, "max": <count>} and the answer is ordinary "blk"
+ *          frames sent back to the ASKER alone (see the reply() below), never a
+ *          broadcast — one node's gap must not cost the whole mesh a re-flood.
+ */
+export type GossipMessageType = "tx" | "blk" | "req"
+
+/** What a listener is handed for one decoded frame. */
+export type GossipMessage = {
+  payload: Uint8Array
+  sig?: Uint8Array
+  pubKey?: Uint8Array
+  raw?: MsgEnvelope
+  /**
+   * Answer THIS sender only, over the socket the frame arrived on.
+   *
+   * broadcast() sends to every peer, which is right for a new transaction or a
+   * new block and wrong for a catch-up answer: a peer that asked for four blocks
+   * would otherwise make every other peer receive them again. Undefined when the
+   * frame did not arrive over a socket this node can write back to.
+   */
+  reply?: (
+    type: GossipMessageType,
+    payload: Uint8Array,
+    opts?: { sig?: Uint8Array; pubKey?: Uint8Array }
+  ) => void
+}
+
 export type GossipNode = {
-  broadcast: (type: "tx" | "blk", payload: Uint8Array, opts?: { sig?: Uint8Array; pubKey?: Uint8Array }) => void
-  on: (type: string, cb: (msg: { payload: Uint8Array; sig?: Uint8Array; pubKey?: Uint8Array; raw?: MsgEnvelope }) => void) => void
+  broadcast: (type: GossipMessageType, payload: Uint8Array, opts?: { sig?: Uint8Array; pubKey?: Uint8Array }) => void
+  on: (type: string, cb: (msg: GossipMessage) => void) => void
   close: () => void
 }
 
 // defensive limits
-const ALLOWED_TYPES = new Set(["tx", "blk"])
+const ALLOWED_TYPES = new Set(["tx", "blk", "req"])
 const MAX_PAYLOAD_HEX = 131072 // max chars in hex (64 KiB bytes)
 const MAX_SIG_HEX = 1024
 const MAX_PUBKEY_HEX = 1024
@@ -84,7 +117,36 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     for (const cb of cbs) cb(obj)
   }
 
-  function handleIncomingMessage(data: WebSocket.Data) {
+  // One place that builds the wire form, so a broadcast and a per-socket reply
+  // are byte-identical envelopes.
+  function encodeEnvelope(
+    type: GossipMessageType,
+    payload: Uint8Array,
+    opts?: { sig?: Uint8Array; pubKey?: Uint8Array }
+  ): string {
+    const env: MsgEnvelope = { type, payloadHex: hex(payload) }
+    if (opts?.sig) env.sigHex = hex(opts.sig)
+    if (opts?.pubKey) env.pubKeyHex = hex(opts.pubKey)
+    return JSON.stringify(env)
+  }
+
+  function replyOver(ws: WebSocket) {
+    return (
+      type: GossipMessageType,
+      payload: Uint8Array,
+      opts?: { sig?: Uint8Array; pubKey?: Uint8Array }
+    ) => {
+      try {
+        ws.send(encodeEnvelope(type, payload, opts))
+      } catch (e) {
+        // a socket that went away mid-answer costs the asker its answer, nothing more
+      }
+    }
+  }
+
+  // `from` is the socket the frame arrived on, so a listener can answer that
+  // peer alone. It is optional so the guards below keep working unchanged.
+  function handleIncomingMessage(data: WebSocket.Data, from?: WebSocket) {
     try {
       // Size first: a peer that sends megabytes of JSON should cost us a
       // length comparison, not a parse and the allocations behind it.
@@ -101,7 +163,13 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
       const payload = fromHex(env.payloadHex)
       const sig = env.sigHex ? fromHex(env.sigHex) : undefined
       const pubKey = env.pubKeyHex ? fromHex(env.pubKeyHex) : undefined
-      emit(env.type, { payload, sig, pubKey, raw: env })
+      emit(env.type, {
+        payload,
+        sig,
+        pubKey,
+        raw: env,
+        reply: from ? replyOver(from) : undefined,
+      })
     } catch (e) {
       // ignore parse errors and invalid envelopes
     }
@@ -110,7 +178,7 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
   server.on("connection", (ws: WebSocket) => {
     sockets.add(ws)
     ws.on("message", (data: WebSocket.Data) => {
-      handleIncomingMessage(data)
+      handleIncomingMessage(data, ws)
     })
     ws.on("close", () => sockets.delete(ws))
     ws.on("error", () => sockets.delete(ws))
@@ -125,7 +193,7 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
         clients.add(c)
       })
       c.on("message", (data: WebSocket.Data) => {
-        handleIncomingMessage(data)
+        handleIncomingMessage(data, c)
       })
       c.on("close", () => clients.delete(c))
       c.on("error", () => clients.delete(c))
@@ -134,11 +202,8 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     }
   }
 
-  function broadcast(type: "tx" | "blk", payload: Uint8Array, opts?: { sig?: Uint8Array; pubKey?: Uint8Array }) {
-    const env: MsgEnvelope = { type, payloadHex: hex(payload) }
-    if (opts?.sig) env.sigHex = hex(opts.sig)
-    if (opts?.pubKey) env.pubKeyHex = hex(opts.pubKey)
-    const s = JSON.stringify(env)
+  function broadcast(type: GossipMessageType, payload: Uint8Array, opts?: { sig?: Uint8Array; pubKey?: Uint8Array }) {
+    const s = encodeEnvelope(type, payload, opts)
     // send to server-connected sockets
     for (const ws of sockets) {
       try {
@@ -153,7 +218,7 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     }
   }
 
-  function on(type: string, cb: (msg: { payload: Uint8Array; sig?: Uint8Array; pubKey?: Uint8Array; raw?: MsgEnvelope }) => void) {
+  function on(type: string, cb: (msg: GossipMessage) => void) {
     const arr = listeners.get(type) || []
     arr.push(cb)
     listeners.set(type, arr)
