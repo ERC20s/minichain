@@ -9,9 +9,31 @@ import { verifyTransaction } from "./tx"
 import { Transaction } from "./types/transaction"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "./validators"
 
+/**
+ * How far ahead of this node's own clock an incoming block may be stamped, in
+ * milliseconds. Two minutes: wide enough for ordinary clock skew between honest
+ * peers on unsynchronised boxes, narrow enough that the timestamp search a
+ * proposer can run against the next height's seed is bounded (see
+ * proposerSeed in src/validators.ts — the seed is the parent's block hash, and
+ * the block hash covers the timestamp).
+ */
+export const MAX_FUTURE_DRIFT_MS = 120000
+
+/** Optional knobs, mainly so tests can inject a clock and a tighter bound. */
+export interface NodeOptions {
+  /** Overrides MAX_FUTURE_DRIFT_MS. Must be a non-negative safe integer. */
+  maxFutureDriftMs?: number
+  /** Overrides Date.now, so a test can place "now" wherever it likes. */
+  now?: () => number
+}
+
 export class Node {
   gossip: GossipNode
   tip: Block
+  /** The accepted future drift for block timestamps, in milliseconds. */
+  maxFutureDriftMs: number
+  /** This node's clock. Injectable so tests do not have to wait for real time. */
+  now: () => number
   /** The staked set this node enforces. Empty = no proof-of-stake check. */
   validators: Validator[]
   /**
@@ -32,10 +54,17 @@ export class Node {
     peers: string[],
     genesis: Block,
     validators: Validator[] = [],
-    openingBalances?: OpeningBalances
+    openingBalances?: OpeningBalances,
+    options?: NodeOptions
   ) {
     this.gossip = startGossipNode(port, peers)
     this.tip = genesis
+    const drift = options && options.maxFutureDriftMs
+    this.maxFutureDriftMs =
+      typeof drift === "number" && Number.isSafeInteger(drift) && drift >= 0
+        ? drift
+        : MAX_FUTURE_DRIFT_MS
+    this.now = options && typeof options.now === "function" ? options.now : () => Date.now()
     this.validators = Array.isArray(validators) ? validators : []
     this.nonces = new NonceLedger(genesis ? genesis.transactions : [])
     this.balances = new BalanceLedger(genesis ? genesis.transactions : [], openingBalances)
@@ -53,6 +82,32 @@ export class Node {
         // block carrying the same transaction list (every empty block shares
         // one root); the header hash is unique to the block.
         if (typeof blk.parentHash !== "string" || blk.parentHash !== blockHash(this.tip)) return
+
+        // timestamp bounds.
+        //
+        // Every other header field was checked and this one was only copied
+        // into the header the signature is verified over, so a proposer could
+        // stamp a block with any integer at all. That mattered twice: the
+        // proposer seed for the NEXT height is "pos:" || blockHash(this block),
+        // and blockHash covers the timestamp, so an unbounded stamp is an
+        // unbounded search over who is elected after you; and a block stamped
+        // in the year 3000, or before its own parent, makes the chain's own
+        // ordering meaningless.
+        //
+        // Three cheap checks, run before the Merkle recompute and the
+        // signature work: the stamp must be a real (non-negative, safe)
+        // integer, it must not go BACKWARDS from the tip (equal is allowed —
+        // blocks minted in the same millisecond are ordinary), and it must not
+        // be further ahead of this node's clock than maxFutureDriftMs. A
+        // failing block is dropped exactly like any other: the tip does not
+        // move and nothing is re-broadcast.
+        if (typeof blk.timestamp !== "number" || !Number.isSafeInteger(blk.timestamp)) return
+        if (blk.timestamp < 0) return
+        const parentStamp = this.tip ? this.tip.timestamp : 0
+        if (typeof parentStamp === "number" && Number.isFinite(parentStamp)) {
+          if (blk.timestamp < parentStamp) return
+        }
+        if (blk.timestamp > this.now() + this.maxFutureDriftMs) return
 
         // recompute merkle root from transactions.
         //
