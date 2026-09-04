@@ -16,6 +16,19 @@ repository):
   validly signed block is accepted; set means only the stake-elected proposer's.
 - `RPC_PORT` — the JSON-RPC HTTP port. Default 9310, `0` turns it off.
 
+## Pending transactions
+
+A gossiped `tx` frame is admitted to this node's mempool (`src/state/mempool.ts`)
+only if it passes the same rules a block is judged by — a valid ed25519
+signature, a nonce strictly above the last one accepted for that sender, and a
+balance covering the amount together with that sender's other pending transfers
+— and is relayed to peers **once**, on first admission, so a transaction cannot
+loop around the mesh. The pool is bounded (1024 transactions, 64 per sender),
+held in memory only, and drained of whatever an accepted block committed.
+`Node.submitTransaction(tx)` offers a locally built transaction through the same
+rules. Nothing in this path moves the tip: the pool is local policy, not
+consensus.
+
 ## JSON-RPC (read only)
 
 `src/rpc/server.ts` serves JSON-RPC 2.0 over HTTP on `RPC_PORT`, bound to
@@ -33,6 +46,7 @@ batch requests.
 | `chain_tip` | none | `{ hash, parentHash, height, timestamp, merkleRoot, transactionCount }` |
 | `chain_getBalance` | `{ account }` or `[account]` | `{ account, balance }` |
 | `chain_getNonce` | `{ account }` or `[account]` | `{ account, nonce }` (`null` if unseen) |
+| `chain_mempool` | none | `{ enabled, size, pending, truncated }` (pending transaction ids) |
 | `chain_validators` | none | `{ validators, totalStake, enforced }` |
 
     curl -s http://127.0.0.1:9310 \

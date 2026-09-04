@@ -20,8 +20,9 @@ import { Validator } from "../validators"
  * block or a peer. That is deliberate, not an omission: src/node.ts is the ONE
  * place a block is judged, and an RPC that could inject one would be a second,
  * unauthenticated path around those checks. The surface talks to the node
- * through RpcNode below — four read accessors and nothing else — so a future
- * write method cannot be added here by accident, only on purpose.
+ * through RpcNode below — a handful of read accessors and nothing else, the
+ * pending-transaction pool included (size and ids, never add or drop) — so a
+ * future write method cannot be added here by accident, only on purpose.
  *
  * LOOPBACK BY DEFAULT. The server binds 127.0.0.1 unless a caller passes another
  * host, so starting a node does not put a new port on the public internet. There
@@ -58,6 +59,14 @@ export const DEFAULT_RPC_HOST = "127.0.0.1"
  */
 export const MAX_RPC_BODY_BYTES = 65536
 
+/**
+ * How many pending transaction ids chain_mempool lists at most. A full pool
+ * (MAX_MEMPOOL = 1024 in src/state/mempool.ts) would otherwise answer with 64 KiB
+ * of hex; the `size` field always reports the true total and `truncated` says the
+ * list was cut.
+ */
+export const RPC_MEMPOOL_MAX_IDS = 256
+
 /** JSON-RPC 2.0 error codes, as the specification defines them. */
 export const RPC_PARSE_ERROR = -32700
 export const RPC_INVALID_REQUEST = -32600
@@ -78,6 +87,15 @@ export interface RpcNode {
   readonly validators: Validator[]
   readonly balances: { balanceOf(account: string): number }
   readonly nonces: { lastNonce(sender: string): number | undefined }
+  /**
+   * The pending-transaction pool, when the node has one (src/state/mempool.ts).
+   *
+   * OPTIONAL and read-only: `size` and `ids()` are all this surface can see, so
+   * chain_mempool can report what is queued and can never admit, relay or
+   * remove anything. A fixture without a pool still satisfies RpcNode and
+   * chain_mempool answers `enabled: false` for it.
+   */
+  readonly mempool?: { readonly size: number; ids(): string[] }
 }
 
 /** The handle startRpcServer returns. */
@@ -227,6 +245,29 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
     const account = accountParam(params)
     const last = node.nonces.lastNonce(account)
     return { account, nonce: last === undefined ? null : last }
+  },
+
+  /**
+   * What this node has pending but not yet in a block.
+   *
+   * Reads only: the size, and up to RPC_MEMPOOL_MAX_IDS transaction ids in
+   * admission order (an id is the hex sha256 of the transaction's Merkle leaf,
+   * see src/state/mempool.ts). `truncated` says the pool holds more than the
+   * listed ids. A node built without a pool answers enabled: false rather than
+   * an error, so the method is safe to poll against any node.
+   */
+  chain_mempool: (node: RpcNode, params: unknown) => {
+    noParams(params, "chain_mempool")
+    const pool = node.mempool
+    if (!pool) return { enabled: false, size: 0, pending: [] as string[], truncated: false }
+    const all = pool.ids() || []
+    const pending = all.slice(0, RPC_MEMPOOL_MAX_IDS)
+    return {
+      enabled: true,
+      size: pool.size,
+      pending,
+      truncated: all.length > pending.length,
+    }
   },
 
   /** The staked set this node enforces. Empty = the permissive path. */
