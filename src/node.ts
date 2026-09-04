@@ -4,14 +4,18 @@ import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
 import { Transaction } from "./types/transaction"
+import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "./validators"
 
 export class Node {
   gossip: GossipNode
   tip: Block
+  /** The staked set this node enforces. Empty = no proof-of-stake check. */
+  validators: Validator[]
 
-  constructor(port: number, peers: string[], genesis: Block) {
+  constructor(port: number, peers: string[], genesis: Block, validators: Validator[] = []) {
     this.gossip = startGossipNode(port, peers)
     this.tip = genesis
+    this.validators = Array.isArray(validators) ? validators : []
 
     this.gossip.on("blk", (m) => {
       try {
@@ -47,6 +51,21 @@ export class Node {
         const msg = canonicalBlockEncoding(header)
         const ok = verify(msg, m.sig, m.pubKey)
         if (!ok) return
+
+        // proof of stake: a valid signature only proves WHO signed the block,
+        // not that they were entitled to propose it. When this node is
+        // configured with a validator set, the signer must be the validator the
+        // stake-weighted selector elects for this height — the seed being the
+        // CURRENT tip's block hash, so the check runs before this.tip moves and
+        // before anything is re-broadcast to peers.
+        if (this.validators.length > 0) {
+          const elected = selectValidator(this.validators, proposerSeed(this.tip))
+          // A set that yields no proposer (all stakes zero, a malformed entry)
+          // elects nobody, so nothing extends the chain: failing closed here is
+          // safer than falling back to "any signature will do".
+          if (elected === null) return
+          if (elected.toLowerCase() !== publicKeyToHex(m.pubKey)) return
+        }
 
         // accept block
         this.tip = blk
