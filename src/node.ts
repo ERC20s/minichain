@@ -3,6 +3,7 @@ import { Block, blockHash, createBlock, transactionLeaves } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { verify } from "./crypto/ed25519"
+import { NonceLedger } from "./state/nonces"
 import { verifyTransaction } from "./tx"
 import { Transaction } from "./types/transaction"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "./validators"
@@ -12,11 +13,17 @@ export class Node {
   tip: Block
   /** The staked set this node enforces. Empty = no proof-of-stake check. */
   validators: Validator[]
+  /**
+   * Last accepted nonce per sender, seeded from genesis. A signature proves a
+   * transfer was authorised; this is the only thing that proves it is fresh.
+   */
+  nonces: NonceLedger
 
   constructor(port: number, peers: string[], genesis: Block, validators: Validator[] = []) {
     this.gossip = startGossipNode(port, peers)
     this.tip = genesis
     this.validators = Array.isArray(validators) ? validators : []
+    this.nonces = new NonceLedger(genesis ? genesis.transactions : [])
 
     this.gossip.on("blk", (m) => {
       try {
@@ -66,6 +73,23 @@ export class Node {
           if (!verifyTransaction(tx)) return
         }
 
+        // replay protection.
+        //
+        // A signature proves the sender consented to THESE bytes; it never
+        // expires, so the identical signed object verifies for ever. Without the
+        // check below a proposer could put an already-accepted transaction into
+        // the next block, or the same one twice into this one, and every check
+        // above still passed — same leaves, same root, same header signature,
+        // same elected proposer — so the transfer happened again.
+        //
+        // Each sender's nonce must be STRICTLY greater than the last one this
+        // node accepted for it, counting transactions earlier in the same block.
+        // Staging touches no state: the ledger is written only at the accept
+        // point below, so a block dropped by the header-signature or proposer
+        // check cannot burn nonces the chain never spent.
+        const staged = this.nonces.stage(txs)
+        if (staged === null) return
+
         // require signature and pubKey
         if (!m.sig || !m.pubKey) return
 
@@ -95,8 +119,10 @@ export class Node {
           if (elected.toLowerCase() !== publicKeyToHex(m.pubKey)) return
         }
 
-        // accept block
+        // accept block: the tip moves and the nonces this block spent are
+        // written together, so the two can never disagree.
         this.tip = blk
+        this.nonces.commit(staged)
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
