@@ -1,5 +1,5 @@
 import { MAX_BLOCK_TRANSACTIONS, Node } from "../src/node"
-import { createBlock } from "../src/block"
+import { blockHash, createGenesisBlock } from "../src/block"
 import { keypairFromSeed } from "../src/crypto/ed25519"
 import { Validator, publicKeyToHex } from "../src/validators"
 import { DEFAULT_RPC_HOST, DEFAULT_RPC_PORT, RPC_METHOD_NAMES, startRpcServer } from "../src/rpc/server"
@@ -100,10 +100,22 @@ const proposeIntervalMs = parseIntervalMs(
   DEFAULT_PROPOSE_INTERVAL_MS
 )
 
-const genesis = createBlock("genesis", 0, [])
+/**
+ * The chain starts from the FIXED genesis block (src/block.ts): parentHash
+ * "genesis", height 0, timestamp 0, no transactions. It used to be
+ * `createBlock("genesis", 0, [])`, which stamped Date.now() — so two nodes
+ * started a millisecond apart held two different genesis hashes and neither
+ * could ever accept the other's block 1 (acceptBlock requires
+ * parentHash === blockHash(tip)). The follower simply stayed at height 0.
+ * createGenesisBlock() is a pure function: the hash printed below is identical
+ * in every terminal, which is how an operator can SEE that two nodes are on one
+ * chain before either of them mints anything.
+ */
+const genesis = createGenesisBlock()
 const node = new Node(port, peers, genesis, validators)
 
 console.log(`minichain node started on port ${port}`)
+console.log(`genesis: ${blockHash(genesis)} (height 0, fixed — every node must print this same hash)`)
 if (peers.length) console.log(`peers: ${peers.join(", ")}`)
 if (validators.length) {
   const total = validators.reduce((sum, v) => sum + v.stake, 0)
