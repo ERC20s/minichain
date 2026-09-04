@@ -53,6 +53,13 @@ Validator selection (new)
 - Ordering rule: the result depends only on the SET of (publicKey, summed stake) pairs and the seed — never on the order the caller assembled its array in. Two nodes holding the same validators and the same seed, but built from a different config order or a different gossip arrival order, elect the same proposer; a node therefore cannot reject a valid block over an ordering difference. A second implementation reproduces the pick by applying the same merge-by-publicKey, drop-zero-stake and byte-wise sort before the cumulative walk.
 - Notes: the seed source is out-of-band and must be provided by the caller; sha256(seed) is simple and deterministic but not a bias-resistant randomness beacon — a VRF or threshold randomness can replace it later.
 
+Gossip envelope limits (src/gossip/ws.ts)
+- Wire format: every gossip frame is a JSON envelope {"type","payloadHex","sigHex?","pubKeyHex?"}. type must be "tx" or "blk"; each hex field must be an even-length string of [0-9a-fA-F] within its maximum (payloadHex 131072 chars = 64 KiB, sigHex 1024, pubKeyHex 1024). A frame that fails any check is dropped silently; it never reaches a listener.
+- Size before parse: the receiver rejects an oversized frame BEFORE JSON.parse, so a hostile peer cannot make a node parse and allocate megabytes to have the envelope thrown away afterwards. Two ordered checks do this:
+  - MAX_ENVELOPE_BYTES = MAX_ENVELOPE_CHARS * 3, compared against the byte length of the incoming frame without converting it to a string. A UTF-8 sequence never uses more than 3 bytes per UTF-16 code unit, so a frame above this bound cannot decode to a string within the character limit — the check can never drop an envelope the character check would have accepted.
+  - MAX_ENVELOPE_CHARS = MAX_PAYLOAD_HEX + MAX_SIG_HEX + MAX_PUBKEY_HEX + 200, compared against the decoded string. The 200 characters cover JSON syntax, field names and quotes; the largest envelope this transport sends adds 66. The limit is derived from the field maxima, so raising a field maximum raises it with no second constant to remember.
+- The limit is a transport bound only: it changes no encoding, no signature and no message semantics, and the biggest legal envelope (64 KiB payload with signature and public key) still passes.
+
 Files added or changed by this cycle (implementation PR will include):
 - SPEC.md (this file, updated to include validator selection)
 - src/coding/serialize.ts (canonical block header encoding and types)
@@ -63,6 +70,8 @@ Files added or changed by this cycle (implementation PR will include):
 - test/transaction-sign.test.ts (transaction signing tests)
 - test/merkle.test.ts (merkle tests)
 - test/validators.test.ts (new tests for validator selection)
+- src/gossip/ws.ts (envelope validation and the pre-JSON.parse size guard described above)
+- test/gossip.test.ts (transport tests, including an oversized frame dropped without parsing and a just-under-the-limit envelope still delivered)
 - test/canonical-validation.test.ts (new: the encoders reject fractional, negative and over-range integers, over-long length-prefixed fields, missing or mistyped string fields and non-round-trippable payload values, while the byte vectors for valid inputs stay identical)
 
 If this passes, a contributor will open a PR adding src/validators.ts, test/validators.test.ts and this SPEC.md update implementing deterministic stake-weighted selection; reviewers will run npm test and ensure all tests pass.
