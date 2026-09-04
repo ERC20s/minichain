@@ -1,8 +1,41 @@
 import { createHash } from "crypto"
+import { Block, blockHash } from "./block"
 
 export type Validator = {
   publicKey: string
   stake: number
+}
+
+/**
+ * Domain separator for the proposer seed, so the bytes selectValidator hashes
+ * can never coincide with a block hash preimage ("blkhash:"), a header signing
+ * preimage ("blk:") or a Merkle leaf ("tx:").
+ */
+export const PROPOSER_SEED_PREFIX = "pos:"
+
+/**
+ * The seed that elects the proposer of the NEXT block: the UTF-8 bytes of
+ * "pos:" || blockHash(parent).
+ *
+ * The parent's block hash commits to its whole header (#42), so the seed moves
+ * with every accepted block and two honest nodes holding the same tip derive
+ * exactly the same seed without any extra out-of-band randomness. It is not a
+ * bias-resistant beacon — a proposer can grind its own block's timestamp to
+ * influence who is elected after it — see SPEC.md.
+ *
+ * Accepts either the parent block or a parent block hash already computed.
+ */
+export function proposerSeed(parent: Block | string): Uint8Array {
+  const hash = typeof parent === "string" ? parent : blockHash(parent)
+  return new TextEncoder().encode(PROPOSER_SEED_PREFIX + hash)
+}
+
+/**
+ * Lower-case hex of a raw public key, the form validator entries use, so a
+ * 32-byte key off the wire can be compared with a Validator.publicKey.
+ */
+export function publicKeyToHex(publicKey: Uint8Array): string {
+  return Buffer.from(publicKey).toString("hex")
 }
 
 function sha256(data: Uint8Array): Uint8Array {
