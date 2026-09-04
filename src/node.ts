@@ -4,6 +4,7 @@ import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
 import { sign, verify } from "./crypto/ed25519"
 import { BalanceLedger, OpeningBalances } from "./state/balances"
+import { ChainStore, DEFAULT_CHAIN_STORE_CAPACITY } from "./state/chain"
 import { Mempool, MempoolOptions, MempoolResult } from "./state/mempool"
 import { NonceLedger } from "./state/nonces"
 import { verifyTransaction } from "./tx"
@@ -22,6 +23,27 @@ export const MAX_FUTURE_DRIFT_MS = 120000
 
 /** How many pending transactions a proposed block carries unless told otherwise. */
 export const MAX_BLOCK_TRANSACTIONS = 256
+
+/**
+ * The most blocks ONE "req" frame is ever answered with.
+ *
+ * The answer is sent to the asker alone, but it is still work this node does on
+ * a stranger's word, so the cap is the whole defence against amplification: a
+ * one-line request can never cost more than 32 block sends. A peer further
+ * behind than that asks again after it has applied what it got.
+ */
+export const MAX_SYNC_BLOCKS = 32
+
+/**
+ * The shortest gap between two catch-up requests from this node, in
+ * milliseconds.
+ *
+ * Without it a node at height 0 watching a busy chain would fire a "req" at
+ * every future block it saw — one per gossiped block, at every peer. One request
+ * per second is far more often than a chain that mints every couple of seconds
+ * needs, and it bounds what a lagging node costs the mesh.
+ */
+export const SYNC_REQUEST_INTERVAL_MS = 1000
 
 /** Optional knobs for one call to proposeBlock. */
 export interface ProposeOptions {
@@ -46,6 +68,17 @@ export interface NodeOptions {
   now?: () => number
   /** Overrides the mempool caps (see src/state/mempool.ts). */
   mempool?: MempoolOptions
+  /**
+   * How many accepted blocks this node keeps for serving catch-up requests.
+   * Must be a positive safe integer; anything else leaves
+   * DEFAULT_CHAIN_STORE_CAPACITY (1024) standing.
+   */
+  chainCapacity?: number
+  /**
+   * Overrides SYNC_REQUEST_INTERVAL_MS, so a test does not have to wait a real
+   * second. Must be a non-negative safe integer.
+   */
+  syncRequestIntervalMs?: number
 }
 
 export class Node {
@@ -75,6 +108,17 @@ export class Node {
    * src/state/mempool.ts — it holds pending transfers and moves no state.
    */
   mempool: Mempool
+  /**
+   * The blocks this node has ACCEPTED, sealed with the header signature and
+   * proposer key they arrived under, bounded to the last `chainCapacity`
+   * heights. It exists so this node can answer a peer that fell behind; nothing
+   * in the acceptance rules reads it. See src/state/chain.ts.
+   */
+  chain: ChainStore
+  /** The shortest gap between two catch-up requests this node sends. */
+  syncRequestIntervalMs: number
+  /** When this node last sent a "req" frame, on its own clock. */
+  private lastSyncRequestAt: number | undefined
 
   constructor(
     port: number,
@@ -97,10 +141,25 @@ export class Node {
     this.balances = new BalanceLedger(genesis ? genesis.transactions : [], openingBalances)
     this.mempool = new Mempool(this.nonces, this.balances, options && options.mempool)
 
+    // Block history. Genesis is NOT put in: every node builds its own with
+    // createGenesisBlock() and there is no seal to serve for it.
+    const capacity = options && options.chainCapacity
+    this.chain = new ChainStore(
+      typeof capacity === "number" && Number.isSafeInteger(capacity) && capacity > 0
+        ? capacity
+        : DEFAULT_CHAIN_STORE_CAPACITY
+    )
+    const interval = options && options.syncRequestIntervalMs
+    this.syncRequestIntervalMs =
+      typeof interval === "number" && Number.isSafeInteger(interval) && interval >= 0
+        ? interval
+        : SYNC_REQUEST_INTERVAL_MS
+    this.lastSyncRequestAt = undefined
+
     // pending transactions.
     //
     // The transport has always accepted this frame type (ALLOWED_TYPES =
-    // {"tx", "blk"}, src/gossip/ws.ts) and nothing listened for it, so a
+    // {"tx", "blk", "req"}, src/gossip/ws.ts) and nothing listened for it, so a
     // gossiped transaction was decoded, emitted and dropped on the floor. It is
     // admitted to the pool here under the SAME rules a block is judged by — the
     // ed25519 transaction signature, a nonce strictly above what this node has
@@ -125,18 +184,27 @@ export class Node {
 
     // incoming blocks.
     //
-    // The listener does two things and no more: decode the frame, and hand it to
-    // acceptBlock() — which holds every rule this chain has, in order. A block
-    // is relayed ONLY when it moved this node's tip, exactly as before, and the
-    // bytes relayed are the bytes that arrived: re-encoding could reorder keys,
-    // and the header signature is over the canonical header, not over this JSON.
+    // The listener does three things and no more: decode the frame, hand it to
+    // acceptBlock() — which holds every rule this chain has, in order — and, when
+    // the block is refused because it is from the FUTURE, ask a peer for the gap.
+    // A block is relayed ONLY when it moved this node's tip, exactly as before,
+    // and the bytes relayed are the bytes that arrived: re-encoding could reorder
+    // keys, and the header signature is over the canonical header, not over this
+    // JSON.
     this.gossip.on("blk", (m) => {
       try {
         // payload is JSON-encoded Block
         const s = new TextDecoder().decode(m.payload)
         const blk = JSON.parse(s) as Block
 
-        if (!this.acceptBlock(blk, m.sig, m.pubKey)) return
+        if (!this.acceptBlock(blk, m.sig, m.pubKey)) {
+          // A refused block is usually junk — but a block whose height is more
+          // than one above our tip is the one refusal that means WE are behind,
+          // not that the sender is wrong. Before this, that block was dropped in
+          // silence and the node never followed the chain again.
+          this.noticeFutureBlock(blk)
+          return
+        }
 
         // re-broadcast to propagate
         this.gossip.broadcast("blk", m.payload, { sig: m.sig, pubKey: m.pubKey })
@@ -144,6 +212,99 @@ export class Node {
         // ignore malformed
       }
     })
+
+    // catch-up requests from a peer that fell behind.
+    //
+    // The payload is {"from": <height>, "max": <count>}. This node answers with
+    // up to MAX_SYNC_BLOCKS consecutive SEALED blocks from its own store, as
+    // ordinary "blk" frames, sent to the ASKER alone (m.reply) — a peer's gap
+    // must not cost the whole mesh a re-flood. Nothing is trusted and nothing is
+    // shortcut: the answer travels the ordinary block path and the asker judges
+    // every block with the same acceptBlock as any other.
+    this.gossip.on("req", (m) => {
+      try {
+        const reply = m.reply
+        // Nothing to answer over: a frame that did not arrive on a socket we can
+        // write back to is dropped rather than turned into a broadcast.
+        if (typeof reply !== "function") return
+
+        const s = new TextDecoder().decode(m.payload)
+        const req = JSON.parse(s) as { from?: unknown; max?: unknown }
+        if (!req || typeof req !== "object") return
+
+        const from = req.from
+        if (typeof from !== "number" || !Number.isSafeInteger(from) || from < 0) return
+
+        // The asker may ask for fewer; it can never ask for more.
+        const asked =
+          typeof req.max === "number" && Number.isSafeInteger(req.max) && req.max > 0
+            ? req.max
+            : MAX_SYNC_BLOCKS
+        const count = Math.min(asked, MAX_SYNC_BLOCKS)
+
+        // range() stops at the first height this node does not hold, so a batch
+        // never carries a hole the asker would stall on. An unheld `from`
+        // answers nothing at all, which is the honest reply.
+        for (const sealed of this.chain.range(from, count)) {
+          // Re-serialised rather than relayed byte-for-byte: this node holds the
+          // block, not the frame it arrived in. That is safe precisely because
+          // nothing signs this JSON — the header signature is over
+          // canonicalBlockEncoding and the Merkle root is recomputed from the
+          // transactions, so key order on the wire is irrelevant.
+          const payload = new TextEncoder().encode(JSON.stringify(sealed.block))
+          reply("blk", payload, { sig: sealed.sig, pubKey: sealed.pubKey })
+        }
+      } catch (e) {
+        // ignore malformed
+      }
+    })
+  }
+
+  /**
+   * A block we refused arrived from above our tip: ask for what is missing.
+   *
+   * Called only from the "blk" listener, only for a block acceptBlock said no
+   * to. A height of exactly tip.height + 1 that was refused is a BAD block (bad
+   * signature, bad root, bad nonce) and must not trigger anything; only a height
+   * strictly above that means this node is missing a link.
+   */
+  private noticeFutureBlock(blk: Block): void {
+    if (!blk || typeof blk !== "object") return
+    if (typeof blk.height !== "number" || !Number.isSafeInteger(blk.height)) return
+    if (blk.height <= this.tip.height + 1) return
+    this.requestSync()
+  }
+
+  /**
+   * Ask peers for the blocks between this node's tip and whatever they hold.
+   *
+   * Broadcasts one "req" frame naming the FIRST height this node needs
+   * (tip.height + 1) and how many it will take (MAX_SYNC_BLOCKS). Rate limited
+   * to one request per syncRequestIntervalMs on this node's own (injectable)
+   * clock, so a node far behind a busy chain asks once a second rather than once
+   * per block it cannot use.
+   *
+   * Returns true when a request actually went out. Never throws.
+   */
+  requestSync(): boolean {
+    try {
+      const clock = this.now()
+      const at = typeof clock === "number" && Number.isFinite(clock) ? clock : Date.now()
+      if (
+        this.lastSyncRequestAt !== undefined &&
+        at - this.lastSyncRequestAt < this.syncRequestIntervalMs
+      ) {
+        return false
+      }
+      this.lastSyncRequestAt = at
+
+      const from = this.tip.height + 1
+      const payload = new TextEncoder().encode(JSON.stringify({ from, max: MAX_SYNC_BLOCKS }))
+      this.gossip.broadcast("req", payload)
+      return true
+    } catch (e) {
+      return false
+    }
   }
 
   /**
@@ -301,6 +462,12 @@ export class Node {
       this.tip = blk
       this.nonces.commit(staged)
       this.balances.commit(stagedBalances)
+      // and the block is kept, sealed with the signature and key it was judged
+      // under, so this node can hand it to a peer that fell behind. Written HERE
+      // and nowhere else, so a self-minted block and a gossiped one are stored
+      // by the same line, and only a block that passed every rule above is ever
+      // served. Bounded to the last chainCapacity heights (src/state/chain.ts).
+      this.chain.put(blk, sig, pubKey)
       // and the pool forgets what this block committed, plus anything the new
       // nonces just made impossible. Run after the commits, so it reads the
       // ledgers at the new tip.

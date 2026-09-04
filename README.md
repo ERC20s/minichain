@@ -38,8 +38,8 @@ so two nodes started a millisecond apart had two different chains and each
 silently dropped the other's blocks while sitting at height 0 for ever.
 
 Nodes in one network must also share the same `VALIDATORS` and the same
-`GENESIS_BALANCES`. There is still no history sync: a node started late cannot
-catch up.
+`GENESIS_BALANCES`. A node that starts late no longer sits at height 0 for ever
+— see **Catching up** below.
 
 ## Producing blocks
 
@@ -58,6 +58,35 @@ publicKey)` on a timer. One tick:
   accepts it. A block we would refuse from a peer is never sent to a peer.
 
 There is still no fork choice: a proposer only ever extends the tip it holds.
+
+## Catching up
+
+A node that joins late, or that misses a `blk` frame, used to stop following the
+chain in silence: `acceptBlock` only ever takes the block at `tip.height + 1`, so
+everything after the gap was a future block and was dropped.
+
+Two things fix that:
+
+- every **accepted** block is kept, sealed with the header signature and
+  proposer key it was judged under, in a bounded store
+  (`src/state/chain.ts`, the last 1024 heights; genesis is never stored, because
+  every node builds its own with `createGenesisBlock()`);
+- a third gossip frame, `req`, whose payload is `{"from": <height>, "max":
+  <count>}`. A node that refuses a block from **above** its own gap broadcasts
+  one `req` for `tip.height + 1`, at most once a second. A node that holds those
+  heights answers with up to 32 consecutive blocks as ordinary `blk` frames,
+  sent back **to the asker only** — one peer's gap does not re-flood the mesh.
+
+Nothing is trusted along the way: a synced block goes through the same
+`Node.acceptBlock` as any other — linkage, timestamp, Merkle root, every
+transaction signature, nonces, balances, the header signature and the
+stake-elected proposer — so a peer that answers with rubbish only wastes its own
+bandwidth. Applying the batch in order is what makes it work: each block in turn
+becomes the tip the next one is judged against.
+
+Limits worth knowing: a node more than 1024 blocks behind (or behind a peer whose
+window has moved past its tip) cannot be helped this way and must restart from
+genesis, nothing is persisted across restarts, and there is still no fork choice.
 
 ## Pending transactions
 
