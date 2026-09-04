@@ -47,6 +47,18 @@ Block signing
 - The canonicalBlockEncoding function concatenates: prefix("blk:") || len(parentHash) || parentHash || height(8) || timestamp(8) || len(merkleRoot) || merkleRoot || len(proposerPublicKey) || proposerPublicKey.
 - Signatures are ed25519 detached 64-byte raw values over the canonicalBlockEncoding output.
 
+Block hash and chain linkage (new)
+- Purpose: a block must be identified by something that commits to its whole header, so that a child names exactly one parent and history is tamper-evident.
+- Block hash: blockHash(block) in src/block.ts returns the lower-case hex sha256 of the domain-separated preimage
+  "blkhash:" (8 ASCII bytes) || canonicalBlockEncoding({parentHash, height, timestamp, merkleRoot}).
+  The canonical block header encoder from src/coding/serialize.ts is reused unchanged, so the same injectivity and validation rules apply: a header with a missing, mistyped, fractional, negative or over-long field throws a CanonicalEncodingError instead of being hashed.
+- proposerPublicKey is ABSENT from the block hash preimage (it therefore encodes as a zero length prefix). The Block interface carries no proposer field and a Uint8Array does not survive JSON.stringify/parse over gossip, so including it would make the hash depend on how a block travelled. Consequence to close later: two blocks that differ only by proposer still have the same block hash.
+- The "blkhash:" prefix is distinct from the "blk:" signing prefix, so a block hash preimage can never coincide with the bytes an ed25519 header signature is made over, nor with a Merkle leaf ("tx:" bytes).
+- Linkage rule: block N+1 is a child of block N when N+1.height === N.height + 1 AND N+1.parentHash === blockHash(N). src/node.ts enforces exactly this in its gossip "blk" handler, before recomputing the Merkle root and verifying the header signature.
+- Why not the Merkle root: merkleRoot commits to the transaction list and to nothing else. Two blocks with the same transactions but a different height, timestamp or parent share a root, and every empty block shares one (merkleRoot([]) is sha256 of no input), so a child linked by root attached equally well to any of them and a parent's header could be swapped with every descendant still verifying.
+- Compatibility: this is a wire-visible format change. Nodes on the old rule and nodes on this rule will not accept one another's blocks, and any stored chain must be rebuilt from a fresh genesis. No encoding version tag is added because canonicalBlockEncoding itself is unchanged; only what parentHash MEANS changes.
+- Genesis: a genesis block's parentHash is an arbitrary caller-chosen string ("0x00" in tests, "genesis" in examples/run-node.ts); nothing verifies it.
+
 Validator selection (new)
 - Purpose: a deterministic, stake-weighted selection function is specified so later cycles can choose block proposers for proof-of-stake.
 - Algorithm: given a list of validators (publicKey, stake) and a seed (Uint8Array), first build the CANONICAL validator set, then walk it. Canonicalisation: reject the whole call (return null) if the input is not an array, the seed is not a Uint8Array, any publicKey is not a string, or any stake is not a finite non-negative integer; merge entries that share a publicKey by summing their stakes as BigInt; drop entries whose summed stake is zero; sort the remainder by publicKey using a byte-wise comparison of its UTF-8 bytes (not locale order, not UTF-16 code-unit order). Compute totalStake as the sum of the canonical stakes; if the canonical set is empty or totalStake is zero return null. Hash the seed with sha256, convert the 32-byte hash to a BigInt, take hv % totalStake to obtain a target. Walk the canonical set in canonical order accumulating stake; the first validator whose cumulative stake exceeds the target is selected.
@@ -72,6 +84,10 @@ Files added or changed by this cycle (implementation PR will include):
 - test/validators.test.ts (new tests for validator selection)
 - src/gossip/ws.ts (envelope validation and the pre-JSON.parse size guard described above)
 - test/gossip.test.ts (transport tests, including an oversized frame dropped without parsing and a just-under-the-limit envelope still delivered)
+- src/block.ts (blockHash: the header hash that identifies a block)
+- src/node.ts (the gossip "blk" handler links a child by blockHash(tip) instead of tip.merkleRoot)
+- test/block-hash.test.ts (new: look-alike blocks share a merkleRoot but not a blockHash, the hash survives a JSON round trip, and a node whose tip is a look-alike rejects the other chain's child)
+- test/node-sync.test.ts (the propagated child is built on blockHash(genesis))
 - test/canonical-validation.test.ts (new: the encoders reject fractional, negative and over-range integers, over-long length-prefixed fields, missing or mistyped string fields and non-round-trippable payload values, while the byte vectors for valid inputs stay identical)
 
 If this passes, a contributor will open a PR adding src/validators.ts, test/validators.test.ts and this SPEC.md update implementing deterministic stake-weighted selection; reviewers will run npm test and ensure all tests pass.
