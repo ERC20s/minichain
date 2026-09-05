@@ -25,6 +25,33 @@ export const MAX_FUTURE_DRIFT_MS = 120000
 export const MAX_BLOCK_TRANSACTIONS = 256
 
 /**
+ * How long one proposer's slot lasts, in milliseconds.
+ *
+ * A CONSENSUS constant, deliberately not a NodeOptions knob: every node must
+ * derive the same round from the same header, and a node with a different slot
+ * length would elect a different proposer and fork.
+ *
+ * The round a candidate block sits in is
+ * `max(0, floor((blk.timestamp - tip.timestamp) / PROPOSER_SLOT_MS))` and it is
+ * mixed into the proposer seed (proposerSeed(parent, round) in
+ * src/validators.ts). That is the whole liveness fix: the seed used to be a pure
+ * function of the tip, so an elected validator that was offline, crashed or
+ * partitioned froze the chain for ever — the tip never moved, so the seed never
+ * changed, so the same absent validator was elected again at every attempt. With
+ * a round, one slot after the tip a DIFFERENT validator is elected and the chain
+ * carries on.
+ *
+ * 6000ms is comfortably above the runner's default PROPOSE_INTERVAL_MS (2000,
+ * examples/run-node.ts): a slot has to be long enough that the elected proposer
+ * gets several ticks to mint and to have its block reach its peers before anyone
+ * else is entitled to the height, because this chain still has no fork choice.
+ * MAX_FUTURE_DRIFT_MS (120000) bounds how far ahead a block may be stamped, so a
+ * grinding proposer can reach at most 20 rounds beyond the accepting node's
+ * clock, not an unbounded search.
+ */
+export const PROPOSER_SLOT_MS = 6000
+
+/**
  * The most blocks ONE "req" frame is ever answered with.
  *
  * The answer is sent to the asker alone, but it is still work this node does on
@@ -403,6 +430,36 @@ export class Node {
   }
 
   /**
+   * Which proposer ROUND a block stamped `timestamp` sits in, measured from
+   * THIS node's current tip.
+   *
+   * `max(0, floor((timestamp - tip.timestamp) / PROPOSER_SLOT_MS))`. Derived,
+   * never carried: nothing in the header names a round, so no encoding,
+   * signature preimage, block hash or Merkle rule changes and two honest nodes
+   * on the same tip read the same round out of the same block. A stamp at or
+   * behind the parent (acceptBlock allows equal) is round 0, which is
+   * byte-for-byte the election this chain has always run.
+   *
+   * Public so a proposer loop, a test or a future RPC can ask "whose slot is it
+   * now?" without duplicating the arithmetic. Never throws.
+   */
+  proposerRound(timestamp: number): number {
+    try {
+      if (typeof timestamp !== "number" || !Number.isFinite(timestamp)) return 0
+      const parentStamp =
+        this.tip && typeof this.tip.timestamp === "number" && Number.isFinite(this.tip.timestamp)
+          ? this.tip.timestamp
+          : 0
+      const elapsed = timestamp - parentStamp
+      if (!(elapsed >= PROPOSER_SLOT_MS)) return 0
+      const round = Math.floor(elapsed / PROPOSER_SLOT_MS)
+      return Number.isSafeInteger(round) && round > 0 ? round : 0
+    } catch (e) {
+      return 0
+    }
+  }
+
+  /**
    * Judge a block against every rule this chain has and, if it passes, make it
    * the tip.
    *
@@ -543,8 +600,19 @@ export class Node {
       // stake-weighted selector elects for this height — the seed being the
       // CURRENT tip's block hash, so the check runs before this.tip moves and
       // before anything is re-broadcast to peers.
+      //
+      // ...and for the ROUND this block's own timestamp sits in. Round 0
+      // (a block stamped inside one slot of its parent) is exactly the seed
+      // this chain always used; each further PROPOSER_SLOT_MS past the parent
+      // re-rolls the election, so an elected validator that is offline no
+      // longer freezes the chain for ever. The round is DERIVED from the
+      // header — nothing claims it — and the timestamp it is derived from has
+      // already been bounded above (not before the parent, not further ahead
+      // than maxFutureDriftMs), so a block signed by the winner of a round its
+      // stamp does not sit in fails right here.
       if (this.validators.length > 0) {
-        const elected = selectValidator(this.validators, proposerSeed(this.tip))
+        const round = this.proposerRound(blk.timestamp)
+        const elected = selectValidator(this.validators, proposerSeed(this.tip, round))
         // A set that yields no proposer (all stakes zero, a malformed entry)
         // elects nobody, so nothing extends the chain: failing closed here is
         // safer than falling back to "any signature will do".
@@ -584,12 +652,20 @@ export class Node {
    *
    * What it does, in order:
    *
-   *  - ELECTION FIRST. When this node is configured with a validator set, the
-   *    key offered here must be the validator selectValidator elects for the
-   *    seed of the CURRENT tip ("pos:" || blockHash(tip), src/validators.ts).
-   *    Not elected — or a set that elects nobody — means null, and nothing is
-   *    signed, so an unelected node never puts a block its peers must drop onto
-   *    the wire.
+   *  - STAMP FIRST. max(this node's clock, the parent's timestamp), so the
+   *    block can never be stamped behind its own parent — the rule acceptBlock
+   *    enforces. The clock is the node's injectable `now`, not Date.now. It is
+   *    computed before anything else because it fixes the ROUND, and the round
+   *    fixes who is elected.
+   *  - ELECTION. When this node is configured with a validator set, the key
+   *    offered here must be the validator selectValidator elects for the seed of
+   *    the CURRENT tip AND the round that stamp sits in ("pos:" ||
+   *    blockHash(tip) [|| ":" || round], src/validators.ts). Not elected — or a
+   *    set that elects nobody — means null, and nothing is signed, so an
+   *    unelected node never puts a block its peers must drop onto the wire. A
+   *    node that loses round 0 mints nothing at this tick and may be elected at
+   *    a later tick, once its clock has moved a whole PROPOSER_SLOT_MS past the
+   *    parent — that is what stops one offline validator halting the chain.
    *  - CONTENT. Up to opts.maxTransactions (default MAX_BLOCK_TRANSACTIONS)
    *    pending transactions from mempool.selectForBlock(), which orders them by
    *    nonce so that each sender's own transactions stage in ascending order AND
@@ -598,9 +674,6 @@ export class Node {
    *    its sender can no longer afford would stop this node minting anything, at
    *    every tick, for ever. A pool that selects nothing mints nothing unless
    *    opts.allowEmpty.
-   *  - STAMP. max(this node's clock, the parent's timestamp), so the block can
-   *    never be stamped behind its own parent — the rule acceptBlock enforces.
-   *    The clock is the node's injectable `now`, not Date.now.
    *  - SELF-JUDGEMENT. The finished block goes through acceptBlock() like any
    *    other. Only if THIS node accepts it — linkage, timestamp, Merkle root,
    *    every transaction signature, nonces, balances, the header signature and
@@ -613,10 +686,28 @@ export class Node {
     try {
       if (!(secretKey instanceof Uint8Array) || !(publicKey instanceof Uint8Array)) return null
 
+      // STAMP FIRST, because the stamp is what decides the round, and the round
+      // is what decides who is elected. Never behind the parent: acceptBlock
+      // refuses a backwards stamp, and a proposer whose box is a second slow
+      // would otherwise mint a block only it believes in.
+      const clock = this.now()
+      const base = typeof clock === "number" && Number.isFinite(clock) ? Math.floor(clock) : Date.now()
+      const parentStamp =
+        this.tip && typeof this.tip.timestamp === "number" && Number.isSafeInteger(this.tip.timestamp)
+          ? this.tip.timestamp
+          : 0
+      const timestamp = Math.max(base, parentStamp)
+
       // Elected? Checked before any work, and against the same seed acceptBlock
-      // will use, because the tip cannot move underneath a synchronous call.
+      // will derive from the block we are about to build — same tip, same
+      // stamp, same round — because the tip cannot move underneath a
+      // synchronous call. A node that loses round 0 mints nothing and simply
+      // keeps ticking; once its own clock has carried it a full
+      // PROPOSER_SLOT_MS past the parent, the round moves on and this same call
+      // may elect it.
       if (this.validators.length > 0) {
-        const elected = selectValidator(this.validators, proposerSeed(this.tip))
+        const round = this.proposerRound(timestamp)
+        const elected = selectValidator(this.validators, proposerSeed(this.tip, round))
         if (elected === null) return null
         if (elected.toLowerCase() !== publicKeyToHex(publicKey)) return null
       }
@@ -635,17 +726,6 @@ export class Node {
       // nothing. A skipped entry stays pending (see src/state/mempool.ts).
       const txs = this.mempool.selectForBlock(cap)
       if (txs.length === 0 && !(opts && opts.allowEmpty === true)) return null
-
-      // Never behind the parent: acceptBlock refuses a backwards stamp, and a
-      // proposer whose box is a second slow would otherwise mint a block only it
-      // believes in.
-      const clock = this.now()
-      const base = typeof clock === "number" && Number.isFinite(clock) ? Math.floor(clock) : Date.now()
-      const parentStamp =
-        this.tip && typeof this.tip.timestamp === "number" && Number.isSafeInteger(this.tip.timestamp)
-          ? this.tip.timestamp
-          : 0
-      const timestamp = Math.max(base, parentStamp)
 
       // Throws for an unencodable or unsigned transaction; a pooled transaction
       // is neither, but a proposer must not die on one.
