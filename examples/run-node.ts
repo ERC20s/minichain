@@ -139,6 +139,7 @@ const openingBalances = parseGenesisBalances(process.env.GENESIS_BALANCES)
  * put a BLOCK into the node. RPC_PORT=0 disables it.
  */
 const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
+const rpcHost = (process.env.RPC_HOST && process.env.RPC_HOST.trim() !== "") ? process.env.RPC_HOST.trim() : DEFAULT_RPC_HOST
 const proposerSeedBytes = parseProposerSeed(process.env.PROPOSER_KEY)
 const proposeIntervalMs = parseIntervalMs(
   "PROPOSE_INTERVAL_MS",
@@ -209,13 +210,13 @@ if (fundedAccounts.length) {
  * on it can submit a BLOCK, so the acceptance rules in src/node.ts stay the only
  * way onto this chain.
  */
-const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, DEFAULT_RPC_HOST) : null
+const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, rpcHost) : null
 if (rpc) {
   rpc
     .ready()
     .then((bound) => {
       const surface = rpc.writesEnabled ? "POST, reads + chain_sendTransaction" : "POST, read-only"
-      console.log(`json-rpc listening on http://${DEFAULT_RPC_HOST}:${bound} (${surface})`)
+      console.log(`json-rpc listening on http://${rpc.host}:${bound} (${surface})`)
       console.log(`json-rpc methods: ${rpcMethodNames(rpc.writesEnabled).join(", ")}`)
     })
     .catch((err: Error) => {
