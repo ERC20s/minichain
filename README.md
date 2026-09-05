@@ -16,6 +16,7 @@ Settings (see `.env.example`; values live on the box, never in the repository):
 - `VALIDATORS` — the staked set, `hexkey:stake,hexkey:stake`. Unset means any
   validly signed block is accepted; set means only the stake-elected proposer's.
 - `RPC_PORT` — the JSON-RPC HTTP port. Default 9310, `0` turns it off.
+- `RPC_HOST` — the host/interface the JSON-RPC HTTP API binds to. Default 127.0.0.1 (loopback); binding to a non-loopback address will disable the chain_sendTransaction write method for safety.
 - `GENESIS_BALANCES` — opening balances, `hexkey:amount,hexkey:amount`. There
   are no fees, no block reward and no mint transaction on this chain, so an
   unset value means every account holds 0, every transfer is refused as
