@@ -278,7 +278,9 @@ export function isLoopbackHost(host: string): boolean {
   const h = host.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "")
   if (h === "localhost") return true
   if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true
-  if (h === "::ffff:127.0.0.1") return true
+  // Accept IPv4-mapped IPv6 addresses in the whole 127.0.0.0/8 range, e.g.
+  // ::ffff:127.0.0.1 and ::ffff:127.0.0.2 — the SPEC promises these count.
+  if (/^::ffff:127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(h)) return true
   return /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(h)
 }
 
