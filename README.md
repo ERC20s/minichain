@@ -48,9 +48,12 @@ Nodes in one network must also share the same `VALIDATORS` and the same
 With `PROPOSER_KEY` set, the runner calls `Node.proposeBlock(secretKey,
 publicKey)` on a timer. One tick:
 
+- stamps the block first, with `max(this node's clock, the parent's timestamp)`,
+  because the stamp decides the slot and the slot decides who is elected;
 - refuses immediately unless this key is the stake-elected proposer for the
-  current tip (`selectValidator(validators, proposerSeed(tip))`), when a
-  validator set is configured;
+  current tip **and that slot**
+  (`selectValidator(validators, proposerSeed(tip, round))`), when a validator
+  set is configured;
 - selects up to 256 pending transactions from the mempool, in nonce order,
   SKIPPING any that would not stage against the current nonce and balance
   ledgers (`Mempool.selectForBlock`). A block is judged all-or-nothing, so
@@ -61,12 +64,38 @@ publicKey)` on a timer. One tick:
   the same block once an earlier transaction credits its sender;
 - mints nothing at all when the selection is empty (pass `{ allowEmpty: true }`
   to override), so an idle chain does not fill with empty blocks;
-- stamps the block with `max(this node's clock, the parent's timestamp)`;
 - signs the header and puts the block through `Node.acceptBlock` — the same and
   only acceptance path a gossiped block takes — and gossips it only if this node
   accepts it. A block we would refuse from a peer is never sent to a peer.
 
-There is still no fork choice: a proposer only ever extends the tip it holds.
+### Slot rotation
+
+The proposer of a height is not one fixed validator. Every block sits in a
+**round**, derived by every node from the block's own header:
+
+```
+round = max(0, floor((block.timestamp - tip.timestamp) / PROPOSER_SLOT_MS))   // 6000ms
+seed  = "pos:" || blockHash(tip)                 // round 0
+      = "pos:" || blockHash(tip) || ":" || round // round 1, 2, 3 ...
+```
+
+Without it the chain could halt for good: the seed was a pure function of the
+tip, so if the validator elected for that tip was offline, crashed or
+partitioned, the tip never moved, the seed never changed and the same absent
+validator was elected for ever — no error, no recovery. Now, one slot after the
+tip, a different validator is elected and the chain carries on.
+
+Round 0 is byte-for-byte the old seed, so a healthy chain — where every block is
+minted well inside its parent's slot — elects exactly who it elected before.
+Nothing is added to the header: the round is derived, so no encoding, block
+hash, signature or Merkle rule changes, and `PROPOSER_SLOT_MS` is a consensus
+constant rather than a setting, because a node using a different slot length
+would elect a different proposer.
+
+The trade-off: if round 0's winner is merely slow rather than absent, two valid
+blocks can appear at one height. There is still no fork choice — a proposer only
+ever extends the tip it holds, and a node keeps the first valid block it saw at
+a height — so the slot is kept wide to keep that window small.
 
 ## Catching up
 

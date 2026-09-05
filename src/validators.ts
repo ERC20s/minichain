@@ -14,20 +14,49 @@ export type Validator = {
 export const PROPOSER_SEED_PREFIX = "pos:"
 
 /**
- * The seed that elects the proposer of the NEXT block: the UTF-8 bytes of
- * "pos:" || blockHash(parent).
+ * Separator between the parent hash and the ROUND in a seed for round > 0. It
+ * cannot appear inside a block hash (hex only), so "hash || :1" can never be
+ * read as some other hash at round 0 — the seeds of two different rounds are
+ * distinct byte strings by construction.
+ */
+export const PROPOSER_ROUND_SEPARATOR = ":"
+
+/**
+ * The seed that elects the proposer of the NEXT block, in a given ROUND:
+ *
+ *   round 0      -> "pos:" || blockHash(parent)
+ *   round R > 0  -> "pos:" || blockHash(parent) || ":" || R
  *
  * The parent's block hash commits to its whole header (#42), so the seed moves
  * with every accepted block and two honest nodes holding the same tip derive
- * exactly the same seed without any extra out-of-band randomness. It is not a
- * bias-resistant beacon — a proposer can grind its own block's timestamp to
- * influence who is elected after it — see SPEC.md.
+ * exactly the same seed without any extra out-of-band randomness.
  *
- * Accepts either the parent block or a parent block hash already computed.
+ * The round is what keeps the chain LIVE. Before it, the seed was a pure
+ * function of the tip: if the validator elected for that tip was offline,
+ * crashed or partitioned, nobody else could ever propose — the tip never moved,
+ * the seed never changed, and the same absent validator was elected for ever.
+ * The round is derived by every node from the candidate block's own timestamp
+ * against the parent's (see PROPOSER_SLOT_MS and Node.proposerRound in
+ * src/node.ts), so no header field, no encoding and no signature changes and
+ * two honest nodes still derive the same seed from the same header.
+ *
+ * Round 0 is byte-for-byte the seed this function always produced, so every
+ * existing block, test vector and election is unchanged.
+ *
+ * It is still not a bias-resistant beacon — a proposer can grind its own
+ * block's timestamp to influence who is elected after it, and now also to reach
+ * a later round it wins; the search is bounded by MAX_FUTURE_DRIFT_MS, see
+ * SPEC.md.
+ *
+ * Accepts either the parent block or a parent block hash already computed. A
+ * round that is not a non-negative safe integer is treated as round 0.
  */
-export function proposerSeed(parent: Block | string): Uint8Array {
+export function proposerSeed(parent: Block | string, round: number = 0): Uint8Array {
   const hash = typeof parent === "string" ? parent : blockHash(parent)
-  return new TextEncoder().encode(PROPOSER_SEED_PREFIX + hash)
+  const r =
+    typeof round === "number" && Number.isSafeInteger(round) && round > 0 ? round : 0
+  const suffix = r === 0 ? "" : PROPOSER_ROUND_SEPARATOR + String(r)
+  return new TextEncoder().encode(PROPOSER_SEED_PREFIX + hash + suffix)
 }
 
 /**

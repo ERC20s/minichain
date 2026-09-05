@@ -56,6 +56,19 @@ describe("Node enforces stake-weighted proposer selection", () => {
     expect(selectValidator([...validators].reverse(), proposerSeed(genesis))).toBe(elected)
   })
 
+  it("is unchanged by slot rotation at round 0", () => {
+    // proposerSeed grew a second argument, the proposer ROUND (see
+    // test/node-proposer-rotation.test.ts). Round 0 — a block stamped inside
+    // one slot of its parent, which is every block on a healthy chain — must
+    // still be byte-for-byte the seed this chain always used, so no existing
+    // block, test vector or election moves.
+    expect(proposerSeed(genesis, 0)).toEqual(proposerSeed(genesis))
+    expect(selectValidator(validators, proposerSeed(genesis, 0))).toBe(elected)
+    // A later slot is a different seed, and may elect somebody else — that is
+    // what stops one offline validator halting the chain.
+    expect(proposerSeed(genesis, 1)).not.toEqual(proposerSeed(genesis))
+  })
+
   /**
    * A -> B -> C. Only B is configured with the validator set. C hears a block
    * only if B re-broadcast it, so C's tip is the witness for "not propagated".
