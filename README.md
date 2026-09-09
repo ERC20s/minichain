@@ -195,6 +195,7 @@ batch requests.
 | `chain_getNonce` | `{ account }` or `[account]` | `{ account, nonce }` (`null` if unseen) |
 | `chain_mempool` | none | `{ enabled, size, pending, truncated }` (pending transaction ids) |
 | `chain_validators` | none | `{ validators, totalStake, enforced }` |
+| `chain_getBlock` | `{ height }` or `[height]` | `{ found, height, hash, parentHash, timestamp, merkleRoot, transactionCount, transactions }` (`found: false, height` when this node does not hold it) |
 | `chain_sendTransaction` **(write, loopback only)** | `{ transaction }` or `[transaction]` | `{ admitted, id, reason }` |
 
     curl -s http://127.0.0.1:9310 \
@@ -214,6 +215,12 @@ a **result**, not an error: `admitted` is `false` and `reason` is one of
 `unauthorised`, `replayed`, `unaffordable`, `duplicate`, `pool-full`,
 `sender-full`, `malformed`. `id` is the transaction id `chain_mempool` lists. The
 transaction reaches the chain only when the elected proposer mints it.
+
+`chain_getBlock` looks up a past block by height from this node's retained
+window (up to 1024 heights, the same store that answers a peer's catch-up
+request — see "Catching up" below). A height this node no longer holds, has
+not reached yet, or genesis (never stored) answers `{ found: false, height }`
+rather than an error.
 
 The write is served **only on a loopback bind** (`127.0.0.0/8`, `::1`,
 `localhost`): widening the bind turns it off — answering `-32601` with
