@@ -202,6 +202,60 @@ describe("read-only JSON-RPC server", () => {
     expect(nonce.body.result.nonce).toBe(node.nonces.lastNonce(accountHex(21)))
   }, 10000)
 
+  it("reads a historical block by height, and reports what it does not hold", async () => {
+    // Height 1 is the block accepted in the previous test — still the tip, and
+    // named RIGHT after it was gossiped in, so the store holds it.
+    const byName = await call(port, "chain_getBlock", { height: 1 })
+    expect(byName.status).toBe(200)
+    expect(byName.body.result).toEqual({
+      found: true,
+      hash: blockHash(node.tip),
+      parentHash: blockHash(genesis),
+      height: 1,
+      timestamp: node.tip.timestamp,
+      merkleRoot: node.tip.merkleRoot,
+      transactionCount: 1,
+      transactions: node.tip.transactions,
+    })
+
+    // Positional params are accepted too, and answer the same thing.
+    const positional = await call(port, "chain_getBlock", [1])
+    expect(positional.body.result).toEqual(byName.body.result)
+
+    // Genesis is never stored (src/state/chain.ts) — an honest "not held",
+    // not an error.
+    const genesisLookup = await call(port, "chain_getBlock", { height: 0 })
+    expect(genesisLookup.status).toBe(200)
+    expect(genesisLookup.body.result).toEqual({ found: false, height: 0 })
+
+    // Far above the tip: also not held, also not an error.
+    const future = await call(port, "chain_getBlock", { height: 999 })
+    expect(future.body.result).toEqual({ found: false, height: 999 })
+
+    // Bad params are -32602, not a silent lookup of NaN or -1.
+    const negative = await call(port, "chain_getBlock", { height: -1 })
+    expect(negative.body.error.code).toBe(RPC_INVALID_PARAMS)
+
+    const fractional = await call(port, "chain_getBlock", { height: 1.5 })
+    expect(fractional.body.error.code).toBe(RPC_INVALID_PARAMS)
+
+    const missing = await call(port, "chain_getBlock", {})
+    expect(missing.body.error.code).toBe(RPC_INVALID_PARAMS)
+
+    // A node with no chain store answers found: false rather than erroring.
+    const stub = {
+      tip: node.tip,
+      validators: [],
+      balances: { balanceOf: () => 0 },
+      nonces: { lastNonce: () => undefined },
+    }
+    const handle = startRpcServer(stub, 0)
+    const stubPort = await handle.ready()
+    const none = await call(stubPort, "chain_getBlock", { height: 1 })
+    expect(none.body.result).toEqual({ found: false, height: 1 })
+    await handle.close()
+  })
+
   it("reports the pending-transaction pool, read-only", async () => {
     const empty = await call(port, "chain_mempool")
     expect(empty.status).toBe(200)
@@ -363,6 +417,7 @@ describe("read-only JSON-RPC server", () => {
       "chain_getNonce",
       "chain_mempool",
       "chain_validators",
+      "chain_getBlock",
     ])
     expect(RPC_WRITE_METHOD_NAMES).toEqual(["chain_sendTransaction"])
     expect(node.mempool.size).toBe(0)

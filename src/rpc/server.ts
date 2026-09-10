@@ -1,6 +1,7 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from "http"
 import { Socket } from "net"
 import { Block, blockHash } from "../block"
+import { SealedBlock } from "../state/chain"
 import { MempoolResult } from "../state/mempool"
 import { Transaction } from "../types/transaction"
 import { Validator } from "../validators"
@@ -108,6 +109,15 @@ export interface RpcNode {
    * chain_mempool answers `enabled: false` for it.
    */
   readonly mempool?: { readonly size: number; ids(): string[] }
+  /**
+   * This node's retained block history (src/state/chain.ts, ChainStore), when it
+   * has one. OPTIONAL and narrowed to `get(height)` alone: chain_getBlock can
+   * look a height up and nothing else — not `put`, not `range` — so it can never
+   * write a block into the store or drain it as a catch-up batch would. A
+   * fixture without it still satisfies RpcNode and chain_getBlock answers
+   * `found: false` for it, the same answer as a height outside the window.
+   */
+  readonly chain?: { get(height: number): SealedBlock | undefined }
   /**
    * Offer a signed transaction to this node (Node.submitTransaction).
    *
@@ -219,6 +229,32 @@ function accountParam(params: unknown): string {
   }
   if (typeof value !== "string" || value.length === 0) {
     throw new RpcError(RPC_INVALID_PARAMS, "account must be a non-empty string")
+  }
+  return value
+}
+
+/**
+ * The single height argument chain_getBlock takes, accepted either by name
+ * ({"height": n}) or positionally ([n]). A non-integer, negative or missing
+ * value is -32602 rather than a silent lookup of height NaN or -1.
+ */
+function heightParam(params: unknown): number {
+  let value: unknown
+  if (Array.isArray(params)) {
+    if (params.length !== 1) {
+      throw new RpcError(RPC_INVALID_PARAMS, "expected exactly one positional parameter: the height")
+    }
+    value = params[0]
+  } else if (params && typeof params === "object") {
+    value = (params as Record<string, unknown>).height
+  } else {
+    throw new RpcError(
+      RPC_INVALID_PARAMS,
+      'params must be {"height": <non-negative integer>} or [<height>]'
+    )
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new RpcError(RPC_INVALID_PARAMS, "height must be a non-negative integer")
   }
   return value
 }
@@ -372,6 +408,34 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
     }))
     const totalStake = validators.reduce((sum, v) => sum + (Number(v.stake) || 0), 0)
     return { validators, totalStake, enforced: validators.length > 0 }
+  },
+
+  /**
+   * A historical block by height, from this node's retained window
+   * (src/state/chain.ts, ChainStore — DEFAULT_CHAIN_STORE_CAPACITY heights,
+   * default 1024). The only way in from outside the process today is the
+   * gossip "req" catch-up frame between nodes; this is the same lookup
+   * (ChainStore.get) reached from JSON-RPC instead.
+   *
+   * Params: {"height": n} or [n], a non-negative integer — otherwise -32602.
+   * Result on a held height: the same fields describeTip() reports (hash,
+   * parentHash, height, timestamp, merkleRoot, transactionCount) plus
+   * `transactions`, the block's own transaction list, and `found: true`.
+   * Result on a height this node does not hold — evicted past the capacity,
+   * above the current tip, or genesis (never stored, see src/state/chain.ts) —
+   * is `{found: false, height}`, an honest answer rather than an error: the
+   * height is well-formed, this node simply does not have it any more (or
+   * yet). A node with no chain store answers the same way.
+   */
+  chain_getBlock: (node: RpcNode, params: unknown) => {
+    const height = heightParam(params)
+    const sealed: SealedBlock | undefined = node.chain ? node.chain.get(height) : undefined
+    if (!sealed) return { found: false, height }
+    return {
+      found: true,
+      ...describeTip(sealed.block),
+      transactions: Array.isArray(sealed.block.transactions) ? sealed.block.transactions : [],
+    }
   },
 })
 
