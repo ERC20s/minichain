@@ -388,19 +388,74 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
    * see src/state/mempool.ts). `truncated` says the pool holds more than the
    * listed ids. A node built without a pool answers enabled: false rather than
    * an error, so the method is safe to poll against any node.
+   *
+   * Optional parameter: accept either a single positional boolean or an object
+   * { includeTransactions: boolean }. When true, the result includes a
+   * `transactions` array of Transaction objects corresponding to the listed
+   * pending ids (same admission order; entries without a pool.get(id) are
+   * omitted). Default (no param) preserves the existing behaviour.
    */
   chain_mempool: (node: RpcNode, params: unknown) => {
-    noParams(params, "chain_mempool")
+    // Parse params permissively: absent/null, empty array, single boolean
+    // positional, or an object with includeTransactions boolean.
+    let includeTransactions = false
+    if (params === undefined || params === null) {
+      includeTransactions = false
+    } else if (Array.isArray(params)) {
+      if (params.length === 0) {
+        includeTransactions = false
+      } else if (params.length === 1) {
+        const v = params[0]
+        if (typeof v !== "boolean") {
+          throw new RpcError(
+            RPC_INVALID_PARAMS,
+            'expected no parameters, a single boolean, or {includeTransactions: boolean}'
+          )
+        }
+        includeTransactions = v
+      } else {
+        throw new RpcError(RPC_INVALID_PARAMS, "expected at most one positional parameter")
+      }
+    } else if (typeof params === "object") {
+      const bag = params as Record<string, unknown>
+      const keys = Object.keys(bag)
+      if (keys.length === 0) {
+        includeTransactions = false
+      } else if (keys.length === 1 && bag.includeTransactions !== undefined) {
+        if (typeof bag.includeTransactions !== "boolean") {
+          throw new RpcError(RPC_INVALID_PARAMS, "includeTransactions must be a boolean")
+        }
+        includeTransactions = bag.includeTransactions
+      } else {
+        throw new RpcError(RPC_INVALID_PARAMS, 'params must be {includeTransactions: boolean} or absent')
+      }
+    } else {
+      throw new RpcError(RPC_INVALID_PARAMS, 'params must be {includeTransactions: boolean} or a single boolean')
+    }
+
     const pool = node.mempool
     if (!pool) return { enabled: false, size: 0, pending: [] as string[], truncated: false }
     const all = pool.ids() || []
     const pending = all.slice(0, RPC_MEMPOOL_MAX_IDS)
-    return {
+    const base: Record<string, unknown> = {
       enabled: true,
       size: pool.size,
       pending,
       truncated: all.length > pending.length,
     }
+    if (includeTransactions) {
+      const txs: Transaction[] = []
+      for (const id of pending) {
+        try {
+          const tx = pool.get(id)
+          if (tx) txs.push(tx)
+        } catch (e) {
+          // ignore anything that cannot be retrieved
+        }
+      }
+      ;(base as any).transactions = txs
+    }
+    return base
   },
 
   /** The staked set this node enforces. Empty = the permissive path. */
