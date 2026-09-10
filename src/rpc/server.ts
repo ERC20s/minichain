@@ -82,6 +82,12 @@ export const RPC_MEMPOOL_MAX_IDS = 256
 /** How many blocks a single chain_getBlockRange request may ask for. */
 export const RPC_BLOCK_RANGE_MAX = 32
 
+// Observability counters exposed by GET /metrics. Module-level so every
+// incoming HTTP request and internal error can be accounted for without
+// introducing additional dependencies.
+let requestsHandled = 0
+let internalErrors = 0
+
 /** JSON-RPC 2.0 error codes, as the specification defines them. */
 export const RPC_PARSE_ERROR = -32700
 export const RPC_INVALID_REQUEST = -32600
@@ -824,6 +830,7 @@ function respond(
     // Anything else is this node's fault, not the caller's — a
     // CanonicalEncodingError out of blockHash, say. The message is kept
     // generic; the node's own logs are where a detail belongs.
+    try { internalErrors++ } catch (ex) {}
     sendJson(res, 500, errorEnvelope(id, RPC_INTERNAL_ERROR, "internal error"))
   }
 }
@@ -835,6 +842,9 @@ function handleRequest(
   writesAllowed: boolean,
   names: string[]
 ): void {
+  // Account for every incoming HTTP request for observability.
+  try { requestsHandled++ } catch (e) {}
+
   // Lightweight health probe: a quick GET /health that returns operational
   // flags without touching the JSON-RPC framing. This lets orchestration and
   // load-balancers probe liveness without sending a POST JSON-RPC body.
@@ -844,6 +854,44 @@ function handleRequest(
     if (path === "/health") {
       const writesEnabled = names.length > RPC_METHOD_NAMES.length
       const body = { ok: true, writesEnabled, methods: names }
+      const text = JSON.stringify(body)
+      const bytes = Buffer.from(text, "utf8")
+      if (!res.writableEnded) {
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": String(bytes.length),
+          "Cache-Control": "no-store",
+        })
+        res.end(bytes)
+      }
+      return
+    }
+
+    // New metrics endpoint: GET /metrics returns a small JSON object useful
+    // for scraping or in tests. It is intentionally read-only and reports only
+    // fields already reachable via other RPC calls or process information.
+    if (path === "/metrics") {
+      // Count this GET as a handled request.
+      try {
+        requestsHandled++
+      } catch (e) {}
+
+      const writesEnabled = names.length > RPC_METHOD_NAMES.length
+      const tipHeight = typeof node.tip === "object" && typeof node.tip.height === "number" ? node.tip.height : 0
+      const mempoolEnabled = node.mempool ? true : false
+      const mempoolSize = node.mempool && typeof node.mempool.size === "number" ? node.mempool.size : 0
+      const body = {
+        ok: true,
+        pid: process.pid,
+        uptimeMs: Math.floor(process.uptime() * 1000),
+        requestsHandled,
+        internalErrors,
+        tipHeight,
+        mempoolEnabled,
+        mempoolSize,
+        writesEnabled,
+        methods: names,
+      }
       const text = JSON.stringify(body)
       const bytes = Buffer.from(text, "utf8")
       if (!res.writableEnded) {
@@ -919,6 +967,8 @@ function handleRequest(
     try {
       respond(node, Buffer.concat(chunks).toString("utf8"), res, writesAllowed, names)
     } catch (e) {
+      // Count an internal server error for observability, then reply.
+      try { internalErrors++ } catch (ex) {}
       sendJson(res, 500, errorEnvelope(null, RPC_INTERNAL_ERROR, "internal error"))
     }
   })
