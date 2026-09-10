@@ -1,8 +1,8 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from "http"
 import { Socket } from "net"
 import { Block, blockHash } from "../block"
-import { SealedBlock } from "../state/chain"
-import { MempoolResult } from "../state/mempool"
+import { SealedBlock, DEFAULT_CHAIN_STORE_CAPACITY } from "../state/chain"
+import { MempoolResult, transactionId } from "../state/mempool"
 import { Transaction } from "../types/transaction"
 import { Validator } from "../validators"
 
@@ -108,7 +108,7 @@ export interface RpcNode {
    * remove anything. A fixture without a pool still satisfies RpcNode and
    * chain_mempool answers `enabled: false` for it.
    */
-  readonly mempool?: { readonly size: number; ids(): string[] }
+  readonly mempool?: { readonly size: number; ids(): string[]; get(id: string): Transaction | undefined }
   /**
    * This node's retained block history (src/state/chain.ts, ChainStore), when it
    * has one. OPTIONAL and narrowed to `get(height)` alone: chain_getBlock can
@@ -436,6 +436,61 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
       ...describeTip(sealed.block),
       transactions: Array.isArray(sealed.block.transactions) ? sealed.block.transactions : [],
     }
+  },
+
+  /** Locate a transaction by its hex id (sha256 of its Merkle leaf).
+
+    Params: {"id": "..."} or ["..."], where id is 64 hex chars.
+    Result: {found: boolean, id, location?, height?, index?, transaction?}
+    - found: false when the id is not in the mempool nor in the retained chain window
+    - location: "mempool" or "chain"
+    - height/index: when in chain, the block height and the transaction index inside the block's transactions array
+    - transaction: the raw transaction object when found
+  */
+  chain_getTransaction: (node: RpcNode, params: unknown) => {
+    // param parsing: accept positional [id] or named {id}
+    let id: unknown
+    if (Array.isArray(params)) {
+      if (params.length !== 1) throw new RpcError(RPC_INVALID_PARAMS, "expected exactly one positional parameter: the transaction id")
+      id = params[0]
+    } else if (params && typeof params === "object") {
+      id = (params as Record<string, unknown>).id
+    } else {
+      throw new RpcError(RPC_INVALID_PARAMS, 'params must be {"id": "<64-hex>"} or ["<64-hex>"]')
+    }
+
+    if (typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id)) {
+      throw new RpcError(RPC_INVALID_PARAMS, "id must be a 64-character lowercase hex string")
+    }
+
+    // Check mempool first, if present and exposing get()
+    const pool = node.mempool
+    if (pool && typeof pool.get === "function") {
+      const tx = pool.get(id)
+      if (tx) return { found: true, id, location: "mempool", transaction: tx }
+    }
+
+    // Look through the retained chain window, bounded by DEFAULT_CHAIN_STORE_CAPACITY
+    const tip = node.tip
+    const cap = DEFAULT_CHAIN_STORE_CAPACITY
+    const start = Math.max(1, tip.height - cap + 1)
+    for (let h = tip.height; h >= start; h--) {
+      const sealed = node.chain ? node.chain.get(h) : undefined
+      if (!sealed) continue
+      const txs = Array.isArray(sealed.block.transactions) ? sealed.block.transactions : []
+      for (let idx = 0; idx < txs.length; idx++) {
+        const tx = txs[idx]
+        let txid: string
+        try {
+          txid = transactionId(tx)
+        } catch (e) {
+          continue
+        }
+        if (txid === id) return { found: true, id, location: "chain", height: sealed.block.height, index: idx, transaction: tx }
+      }
+    }
+
+    return { found: false, id }
   },
 })
 
