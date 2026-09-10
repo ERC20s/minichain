@@ -418,6 +418,7 @@ describe("read-only JSON-RPC server", () => {
       "chain_mempool",
       "chain_validators",
       "chain_getBlock",
+      "chain_getTransaction",
     ])
     expect(RPC_WRITE_METHOD_NAMES).toEqual(["chain_sendTransaction"])
     expect(node.mempool.size).toBe(0)
