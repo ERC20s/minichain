@@ -89,6 +89,12 @@ export const RPC_METHOD_NOT_FOUND = -32601
 export const RPC_INVALID_PARAMS = -32602
 export const RPC_INTERNAL_ERROR = -32603
 
+/** In-memory observability counters. Incremented per incoming HTTP request
+  * and when internal server errors occur. These are process-local counters and
+  * do not persist across restarts. */
+export let requestsHandled = 0
+export let internalErrors = 0
+
 /**
  * What the RPC surface is allowed to see of a Node.
  *
@@ -824,6 +830,7 @@ function respond(
     // Anything else is this node's fault, not the caller's — a
     // CanonicalEncodingError out of blockHash, say. The message is kept
     // generic; the node's own logs are where a detail belongs.
+    internalErrors++
     sendJson(res, 500, errorEnvelope(id, RPC_INTERNAL_ERROR, "internal error"))
   }
 }
@@ -838,9 +845,44 @@ function handleRequest(
   // Lightweight health probe: a quick GET /health that returns operational
   // flags without touching the JSON-RPC framing. This lets orchestration and
   // load-balancers probe liveness without sending a POST JSON-RPC body.
+  // Count this incoming HTTP request exactly once.
+  requestsHandled++
+
   if (req.method === "GET") {
     const url = req.url || "/"
     const path = url.split("?")[0]
+    if (path === "/metrics") {
+      // Expose a small, stable JSON object for scrapers and tests. Do not
+      // attempt any writes here; just read node state safely.
+      const writesEnabled = names.length > RPC_METHOD_NAMES.length
+      const mempoolEnabled = !!(node as any).mempool
+      const mempoolSize = mempoolEnabled ? (node as any).mempool.size || 0 : 0
+      const tipHeight = node && (node as any).tip && typeof (node as any).tip.height === "number" ? (node as any).tip.height : null
+      const body = {
+        ok: true,
+        pid: typeof process !== "undefined" && typeof process.pid === "number" ? process.pid : null,
+        uptimeMs: typeof process !== "undefined" && typeof process.uptime === "function" ? Math.floor(process.uptime() * 1000) : null,
+        requestsHandled,
+        internalErrors,
+        tipHeight,
+        mempoolEnabled,
+        mempoolSize,
+        writesEnabled,
+        methods: names,
+      }
+      const text = JSON.stringify(body)
+      const bytes = Buffer.from(text, "utf8")
+      if (!res.writableEnded) {
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": String(bytes.length),
+          "Cache-Control": "no-store",
+        })
+        res.end(bytes)
+      }
+      return
+    }
+
     if (path === "/health") {
       const writesEnabled = names.length > RPC_METHOD_NAMES.length
       const body = { ok: true, writesEnabled, methods: names }
@@ -919,6 +961,7 @@ function handleRequest(
     try {
       respond(node, Buffer.concat(chunks).toString("utf8"), res, writesAllowed, names)
     } catch (e) {
+      internalErrors++
       sendJson(res, 500, errorEnvelope(null, RPC_INTERNAL_ERROR, "internal error"))
     }
   })
@@ -962,6 +1005,7 @@ export function startRpcServer(
     try {
       handleRequest(node, req, res, writesAllowed, names)
     } catch (e) {
+      internalErrors++
       sendJson(res, 500, errorEnvelope(null, RPC_INTERNAL_ERROR, "internal error"))
     }
   })
