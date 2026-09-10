@@ -950,7 +950,11 @@ export function startRpcServer(
   // whether this node can actually honour one. The first decides -32601
   // "not-loopback"; the second is the method's own "unsupported" answer. Only
   // when both hold is chain_sendTransaction advertised.
-  const writesAllowed = isLoopbackHost(host)
+  // Normalise a bracketed IPv6 host ("[::1]") to the literal the Node runtime
+  // expects ("::1"). Keep the original parameter untouched for callers, but
+  // use bindHost for loopback detection and the actual server.listen call.
+  const bindHost = typeof host === "string" ? host.trim().replace(/^\[/, "").replace(/\]$/, "") : host
+  const writesAllowed = isLoopbackHost(bindHost)
   const writesEnabled = writesAllowed && typeof node.submitTransaction === "function"
   const names = rpcMethodNames(writesEnabled)
   const sockets: Set<Socket> = new Set()
@@ -979,7 +983,7 @@ export function startRpcServer(
       if (address && typeof address === "object") bound = address.port
       resolve(bound)
     })
-    server.listen(port, host)
+    server.listen(port, bindHost)
   })
   // A bind failure is reported through ready(); a caller that never asks must
   // not bring the process down with an unhandled rejection.
@@ -998,7 +1002,7 @@ export function startRpcServer(
     get port() {
       return bound
     },
-    host,
+    host: bindHost,
     writesEnabled,
     ready: () => listening,
     close: () =>
