@@ -780,6 +780,29 @@ function handleRequest(
   writesAllowed: boolean,
   names: string[]
 ): void {
+  // Lightweight health probe: a quick GET /health that returns operational
+  // flags without touching the JSON-RPC framing. This lets orchestration and
+  // load-balancers probe liveness without sending a POST JSON-RPC body.
+  if (req.method === "GET") {
+    const url = req.url || "/"
+    const path = url.split("?")[0]
+    if (path === "/health") {
+      const writesEnabled = names.length > RPC_METHOD_NAMES.length
+      const body = { ok: true, writesEnabled, methods: names }
+      const text = JSON.stringify(body)
+      const bytes = Buffer.from(text, "utf8")
+      if (!res.writableEnded) {
+        res.writeHead(200, {
+          "Content-Type": "application/json; charset=utf-8",
+          "Content-Length": String(bytes.length),
+          "Cache-Control": "no-store",
+        })
+        res.end(bytes)
+      }
+      return
+    }
+  }
+
   if (req.method !== "POST") {
     res.setHeader("Allow", "POST")
     sendJson(
