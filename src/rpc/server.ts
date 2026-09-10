@@ -116,8 +116,12 @@ export interface RpcNode {
    * write a block into the store or drain it as a catch-up batch would. A
    * fixture without it still satisfies RpcNode and chain_getBlock answers
    * `found: false` for it, the same answer as a height outside the window.
+   *
+   * The ChainStore instance also exposes `capacity` at runtime; tests and
+   * fixtures may omit it, so it is optional here. When present the server
+   * prefers it to the compile-time DEFAULT_CHAIN_STORE_CAPACITY constant.
    */
-  readonly chain?: { get(height: number): SealedBlock | undefined }
+  readonly chain?: { get(height: number): SealedBlock | undefined; readonly capacity?: number }
   /**
    * Offer a signed transaction to this node (Node.submitTransaction).
    *
@@ -470,9 +474,10 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
       if (tx) return { found: true, id, location: "mempool", transaction: tx }
     }
 
-    // Look through the retained chain window, bounded by DEFAULT_CHAIN_STORE_CAPACITY
+    // Look through the retained chain window. Prefer the node's own ChainStore
+    // capacity when it exposes one, falling back to the compile-time default.
     const tip = node.tip
-    const cap = DEFAULT_CHAIN_STORE_CAPACITY
+    const cap = (node.chain && typeof (node.chain as any).capacity === "number") ? (node.chain as any).capacity : DEFAULT_CHAIN_STORE_CAPACITY
     const start = Math.max(1, tip.height - cap + 1)
     for (let h = tip.height; h >= start; h--) {
       const sealed = node.chain ? node.chain.get(h) : undefined
