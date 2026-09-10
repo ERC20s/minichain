@@ -79,6 +79,9 @@ export const MAX_RPC_BODY_BYTES = 65536
  */
 export const RPC_MEMPOOL_MAX_IDS = 256
 
+/** How many blocks a single chain_getBlockRange request may ask for. */
+export const RPC_BLOCK_RANGE_MAX = 32
+
 /** JSON-RPC 2.0 error codes, as the specification defines them. */
 export const RPC_PARSE_ERROR = -32700
 export const RPC_INVALID_REQUEST = -32600
@@ -495,6 +498,58 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
       ...describeTip(sealed.block),
       transactions: Array.isArray(sealed.block.transactions) ? sealed.block.transactions : [],
     }
+  },
+
+  /**
+   * Read a consecutive window of retained blocks starting at `from`.
+   *
+   * Params: {from, max} or [from, max]. Both must be non-negative safe
+   * integers; max must be > 0. The method returns {from, requested, returned,
+   * blocks: [...]}. If the block at `from` is not held the blocks array is
+   * empty. The server will not return more than RPC_BLOCK_RANGE_MAX blocks even
+   * when asked for more; `requested` echoes the caller's requested max.
+   */
+  chain_getBlockRange: (node: RpcNode, params: unknown) => {
+    // parse params: positional [from, max] or named {from, max}
+    let from: unknown
+    let max: unknown
+    if (Array.isArray(params)) {
+      if (params.length !== 2) throw new RpcError(RPC_INVALID_PARAMS, "expected exactly two positional parameters: from and max")
+      from = params[0]
+      max = params[1]
+    } else if (params && typeof params === "object") {
+      const bag = params as Record<string, unknown>
+      from = bag.from
+      max = bag.max
+    } else {
+      throw new RpcError(RPC_INVALID_PARAMS, 'params must be {from: <non-negative integer>, max: <positive integer>} or [from, max]')
+    }
+
+    if (typeof from !== "number" || !Number.isSafeInteger(from) || from < 0) {
+      throw new RpcError(RPC_INVALID_PARAMS, "from must be a non-negative integer")
+    }
+    if (typeof max !== "number" || !Number.isSafeInteger(max) || max <= 0) {
+      throw new RpcError(RPC_INVALID_PARAMS, "max must be a positive integer")
+    }
+
+    const requested = max as number
+    const allowed = Math.min(requested, RPC_BLOCK_RANGE_MAX)
+
+    const blocks: unknown[] = []
+    // If there is no chain store, or the starting height is not held, return empty
+    const store = node.chain
+    if (!store) return { from: from as number, requested, returned: 0, blocks }
+
+    for (let h = from as number; h < (from as number) + allowed; h++) {
+      const sealed: SealedBlock | undefined = store.get(h)
+      if (!sealed) {
+        // stop at the first gap; if the first is missing, blocks stays empty
+        break
+      }
+      blocks.push({ found: true, ...describeTip(sealed.block), transactions: Array.isArray(sealed.block.transactions) ? sealed.block.transactions : [] })
+    }
+
+    return { from: from as number, requested, returned: blocks.length, blocks }
   },
 
   /** Locate a transaction by its hex id (sha256 of its Merkle leaf).
