@@ -1,5 +1,5 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from "http"
-import { Socket } from "net"
+import { Socket, isIP } from "net"
 import { Block, blockHash } from "../block"
 import { SealedBlock, DEFAULT_CHAIN_STORE_CAPACITY } from "../state/chain"
 import { MempoolResult, transactionId } from "../state/mempool"
@@ -330,13 +330,43 @@ function transactionParam(params: unknown): Transaction {
  */
 export function isLoopbackHost(host: string): boolean {
   if (typeof host !== "string") return false
+  // Strip optional IPv6 brackets and normalise case/whitespace
   const h = host.trim().toLowerCase().replace(/^\[/, "").replace(/\]$/, "")
   if (h === "localhost") return true
-  if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true
-  // Accept IPv4-mapped IPv6 addresses in the whole 127.0.0.0/8 range, e.g.
-  // ::ffff:127.0.0.1 and ::ffff:127.0.0.2 — the SPEC promises these count.
-  if (/^::ffff:127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(h)) return true
-  return /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(h)
+
+  // Use Node's isIP to validate addresses rather than permissive regexes.
+  // IPv4 literal: valid only when inside 127.0.0.0/8
+  try {
+    const ipVersion = isIP(h)
+    if (ipVersion === 4) {
+      return h.startsWith("127.")
+    }
+    if (ipVersion === 6) {
+      // Exact IPv6 loopback
+      if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true
+
+      // IPv4-mapped IPv6: ::ffff:127.0.0.1 or ::ffff:7f000001 (32-bit hex)
+      if (h.startsWith("::ffff:")) {
+        const tail = h.slice("::ffff:".length)
+        // dotted notation
+        if (isIP(tail) === 4) {
+          return tail.startsWith("127.")
+        }
+        // 32-bit hex form like 7f000001
+        if (/^[0-9a-f]{1,8}$/.test(tail)) {
+          const val = parseInt(tail, 16)
+          if (!Number.isFinite(val)) return false
+          const b1 = (val >>> 24) & 0xff
+          // b1 is the IPv4 first octet
+          return b1 === 127
+        }
+      }
+    }
+  } catch (e) {
+    // Fall through to returning false for anything we cannot confidently classify
+  }
+
+  return false
 }
 
 /** Methods with no parameters still refuse a parameter they cannot honour. */
