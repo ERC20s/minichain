@@ -1075,7 +1075,15 @@ export function startRpcServer(
   // expects ("::1"). Keep the original parameter untouched for callers, but
   // use bindHost for loopback detection and the actual server.listen call.
   const bindHost = typeof host === "string" ? host.trim().replace(/^\[/, "").replace(/\]$/, "") : host
-  const writesAllowed = isLoopbackHost(bindHost)
+  // Allow an operator-controlled opt-in that permits write methods even when
+  // the server is bound to a non-loopback host. The environment variable
+  // RPC_ALLOW_WRITES accepts "1" or "true" (case-insensitive). This keeps
+  // the safe default (writes only on loopback) unless explicitly enabled.
+  const envAllowRaw = typeof process !== "undefined" && process.env && process.env.RPC_ALLOW_WRITES !== undefined
+    ? String(process.env.RPC_ALLOW_WRITES).trim().toLowerCase()
+    : ""
+  const envAllow = envAllowRaw === "1" || envAllowRaw === "true"
+  const writesAllowed = isLoopbackHost(bindHost) || envAllow
   const writesEnabled = writesAllowed && typeof node.submitTransaction === "function"
   const names = rpcMethodNames(writesEnabled)
   const sockets: Set<Socket> = new Set()

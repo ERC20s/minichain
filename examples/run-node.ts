@@ -142,6 +142,12 @@ const openingBalances = parseGenesisBalances(process.env.GENESIS_BALANCES)
  */
 const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
 const rpcHost = (process.env.RPC_HOST && process.env.RPC_HOST.trim() !== "") ? process.env.RPC_HOST.trim() : DEFAULT_RPC_HOST
+// Opt-in to permit the chain_sendTransaction write method on non-loopback
+// binds. When set to "1" or "true" (case-insensitive), RPC_ALLOW_WRITES lets
+// operators bind RPC_HOST to 0.0.0.0 or another non-loopback interface and still
+// serve the write method. This is explicitly opt-in because the RPC has no
+// authentication and exposing write methods to a public interface is risky.
+const rpcAllowWritesNote = "Set RPC_ALLOW_WRITES=1 to permit chain_sendTransaction on non-loopback binds"
 const proposerSeedBytes = parseProposerSeed(process.env.PROPOSER_KEY)
 const proposeIntervalMs = parseIntervalMs(
   "PROPOSE_INTERVAL_MS",
