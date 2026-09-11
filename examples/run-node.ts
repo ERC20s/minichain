@@ -26,12 +26,17 @@ function parseValidators(env?: string): Validator[] {
       continue
     }
     const publicKey = entry.slice(0, at).trim().toLowerCase()
-    const stake = Number(entry.slice(at + 1).trim())
-    if (!/^[0-9a-f]+$/.test(publicKey) || publicKey.length % 2 !== 0) {
-      console.warn(`ignoring VALIDATORS entry with a non-hex key: ${entry}`)
+    const stakeStr = entry.slice(at + 1).trim()
+    if (!/^[0-9a-f]{64}$/.test(publicKey)) {
+      console.warn(`ignoring VALIDATORS entry with a non-hex or wrong-length key: ${entry}`)
       continue
     }
-    if (!Number.isFinite(stake) || !Number.isInteger(stake) || stake < 0) {
+    if (!/^[0-9]+$/.test(stakeStr)) {
+      console.warn(`ignoring VALIDATORS entry with a non-integer stake: ${entry}`)
+      continue
+    }
+    const stake = Number(stakeStr)
+    if (!Number.isSafeInteger(stake) || stake < 0) {
       console.warn(`ignoring VALIDATORS entry with a bad stake: ${entry}`)
       continue
     }
@@ -70,16 +75,27 @@ function parseGenesisBalances(env?: string): Record<string, number> {
       continue
     }
     const account = entry.slice(0, at).trim().toLowerCase()
-    const amount = Number(entry.slice(at + 1).trim())
-    if (!/^[0-9a-f]+$/.test(account) || account.length % 2 !== 0) {
-      console.warn(`ignoring GENESIS_BALANCES entry with a non-hex account: ${entry}`)
+    const amountStr = entry.slice(at + 1).trim()
+    if (!/^[0-9a-f]{64}$/.test(account)) {
+      console.warn(`ignoring GENESIS_BALANCES entry with a non-hex or wrong-length account: ${entry}`)
       continue
     }
+    if (!/^[0-9]+$/.test(amountStr)) {
+      console.warn(`ignoring GENESIS_BALANCES entry with a non-integer amount: ${entry}`)
+      continue
+    }
+    const amount = Number(amountStr)
     if (!Number.isInteger(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
       console.warn(`ignoring GENESIS_BALANCES entry with a bad amount: ${entry}`)
       continue
     }
-    out[account] = (out[account] || 0) + amount
+    const current = out[account] || 0
+    const total = current + amount
+    if (total > Number.MAX_SAFE_INTEGER) {
+      console.warn(`ignoring GENESIS_BALANCES entry because sum exceeds MAX_SAFE_INTEGER: ${entry}`)
+      continue
+    }
+    out[account] = total
   }
   return out
 }
@@ -89,9 +105,15 @@ function parseGenesisBalances(env?: string): Record<string, number> {
  * the default with a warning rather than handing NaN to listen().
  */
 function parsePort(name: string, raw: string | undefined, fallback: number): number {
-  if (raw === undefined || raw.trim() === "") return fallback
-  const value = parseInt(raw, 10)
-  if (!Number.isInteger(value) || value < 0 || value > 65535) {
+  if (raw === undefined) return fallback
+  const s = raw.trim()
+  if (s === "") return fallback
+  if (!/^\d+$/.test(s)) {
+    console.warn(`ignoring ${name}=${raw}: not a port number, using ${fallback}`)
+    return fallback
+  }
+  const value = Number(s)
+  if (value < 0 || value > 65535) {
     console.warn(`ignoring ${name}=${raw}: not a port number, using ${fallback}`)
     return fallback
   }
