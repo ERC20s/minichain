@@ -708,10 +708,22 @@ export function rpcMethodNames(writesEnabled: boolean): string[] {
   return writesEnabled ? RPC_METHOD_NAMES.concat(RPC_WRITE_METHOD_NAMES) : RPC_METHOD_NAMES.slice()
 }
 
+function addCorsHeaders(res: ServerResponse, allowHeaders?: string): void {
+  try {
+    res.setHeader("Access-Control-Allow-Origin", "*")
+    res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS")
+    res.setHeader("Access-Control-Allow-Headers", allowHeaders || "Content-Type")
+  } catch (e) {
+    // setHeader may throw if the response is already finished; ignore
+  }
+}
+
 function sendJson(res: ServerResponse, status: number, body: JsonRpcEnvelope): void {
   const text = JSON.stringify(body)
   const bytes = Buffer.from(text, "utf8")
   if (res.writableEnded) return
+  // Ensure JSON responses include the Access-Control-Allow-Origin header for browser clients
+  addCorsHeaders(res)
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Content-Length": String(bytes.length),
@@ -903,6 +915,8 @@ function handleRequest(
       const text = JSON.stringify(body)
       const bytes = Buffer.from(text, "utf8")
       if (!res.writableEnded) {
+        // Add CORS headers so browser-based scrapers can fetch /metrics in dev
+        addCorsHeaders(res)
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
           "Content-Length": String(bytes.length),
@@ -919,6 +933,8 @@ function handleRequest(
       const text = JSON.stringify(body)
       const bytes = Buffer.from(text, "utf8")
       if (!res.writableEnded) {
+        // Add CORS headers so browser-based health checks can succeed in dev
+        addCorsHeaders(res)
         res.writeHead(200, {
           "Content-Type": "application/json; charset=utf-8",
           "Content-Length": String(bytes.length),
@@ -928,6 +944,19 @@ function handleRequest(
       }
       return
     }
+  }
+
+  if (req.method === "OPTIONS") {
+    // CORS preflight: reply with the allowed methods and headers. A simple
+    // permissive reply is fine for a dev-focused server; the write method is
+    // still gated by the bind address, not by CORS.
+    addCorsHeaders(res, String(req.headers['access-control-request-headers'] || "Content-Type"))
+    res.setHeader("Allow", "POST, OPTIONS")
+    if (!res.writableEnded) {
+      res.writeHead(204)
+      res.end()
+    }
+    return
   }
 
   if (req.method !== "POST") {
