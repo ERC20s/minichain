@@ -430,6 +430,20 @@ export class Node {
   }
 
   /**
+   * Return simple peer counts when the gossip transport provides them.
+   */
+  peerCounts(): { inbound: number; outbound: number; total: number } {
+    try {
+      if (typeof (this.gossip as any).peerCounts === "function") {
+        return (this.gossip as any).peerCounts()
+      }
+    } catch (e) {
+      // fall through to the safe default
+    }
+    return { inbound: 0, outbound: 0, total: 0 }
+  }
+
+  /**
    * Which proposer ROUND a block stamped `timestamp` sits in, measured from
    * THIS node's current tip.
    *

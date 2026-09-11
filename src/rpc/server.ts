@@ -145,6 +145,12 @@ export interface RpcNode {
    * chain_sendTransaction answers -32601 (data.reason "unsupported") for it.
    */
   readonly submitTransaction?: (tx: Transaction) => MempoolResult
+  /**
+   * OPTIONAL: a node may expose peer counts for observability. When present
+   * this method must return the numbers of inbound and outbound sockets and
+   * their sum. Tests and RPC server will call it if available.
+   */
+  readonly peerCounts?: () => { inbound: number; outbound: number; total: number }
 }
 
 /** The handle startRpcServer returns. */
@@ -361,6 +367,26 @@ type RpcMethod = (node: RpcNode, params: unknown) => unknown
  * loopback rule applies to it.
  */
 export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
+  /** Report simple gossip peer counts when the node offers them. */
+  chain_peers: (node: RpcNode, params: unknown) => {
+    noParams(params, "chain_peers")
+    try {
+      if (typeof (node as any).peerCounts === "function") {
+        const counts = (node as any).peerCounts()
+        if (
+          counts &&
+          typeof counts.inbound === "number" &&
+          typeof counts.outbound === "number" &&
+          typeof counts.total === "number"
+        ) {
+          return { supported: true, ...counts }
+        }
+      }
+    } catch (e) {
+      // fall through
+    }
+    return { supported: false }
+  },
   /** The height of this node's current tip. */
   chain_height: (node: RpcNode, params: unknown) => {
     noParams(params, "chain_height")
