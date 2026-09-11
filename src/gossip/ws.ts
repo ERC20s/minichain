@@ -63,6 +63,11 @@ export type GossipNode = {
    * "req" at once instead of waiting for a future block to notice the gap.
    */
   onPeerOpen: (cb: (url: string) => void) => void
+  /**
+   * Return simple peer counts for introspection: inbound server sockets,
+   * outbound client sockets that are currently open, and their sum.
+   */
+  peerCounts: () => { inbound: number; outbound: number; total: number }
   close: () => void
 }
 
@@ -346,5 +351,11 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     peerSockets.clear()
   }
 
-  return { broadcast, on, onPeerOpen, close }
+  function peerCounts() {
+    const inbound = sockets.size
+    const outbound = clients.size
+    return { inbound, outbound, total: inbound + outbound }
+  }
+
+  return { broadcast, on, onPeerOpen, peerCounts, close }
 }
