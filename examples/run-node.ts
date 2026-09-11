@@ -16,7 +16,7 @@ function parsePeers(env?: string): string[] {
  * a valid header signature extends the chain. Each key is the lower-case hex of
  * a raw 32-byte ed25519 public key; each stake a non-negative integer.
  */
-function parseValidators(env?: string): Validator[] {
+export function parseValidators(env?: string): Validator[] {
   if (!env) return []
   const out: Validator[] = []
   for (const entry of env.split(",").map(s => s.trim()).filter(Boolean)) {
@@ -27,8 +27,9 @@ function parseValidators(env?: string): Validator[] {
     }
     const publicKey = entry.slice(0, at).trim().toLowerCase()
     const stake = Number(entry.slice(at + 1).trim())
-    if (!/^[0-9a-f]+$/.test(publicKey) || publicKey.length % 2 !== 0) {
-      console.warn(`ignoring VALIDATORS entry with a non-hex key: ${entry}`)
+    // Accept only a strict 64-character lowercase hex string (32 bytes)
+    if (!/^[0-9a-f]{64}$/.test(publicKey)) {
+      console.warn(`ignoring VALIDATORS entry with a non-64-hex key: ${entry}`)
       continue
     }
     if (!Number.isFinite(stake) || !Number.isInteger(stake) || stake < 0) {
@@ -60,7 +61,7 @@ function parseValidators(env?: string): Validator[] {
  * unreadable entry is warned about and skipped rather than silently funding
  * nobody.
  */
-function parseGenesisBalances(env?: string): Record<string, number> {
+export function parseGenesisBalances(env?: string): Record<string, number> {
   const out: Record<string, number> = {}
   if (!env) return out
   for (const entry of env.split(",").map(s => s.trim()).filter(Boolean)) {
@@ -71,8 +72,9 @@ function parseGenesisBalances(env?: string): Record<string, number> {
     }
     const account = entry.slice(0, at).trim().toLowerCase()
     const amount = Number(entry.slice(at + 1).trim())
-    if (!/^[0-9a-f]+$/.test(account) || account.length % 2 !== 0) {
-      console.warn(`ignoring GENESIS_BALANCES entry with a non-hex account: ${entry}`)
+    // Accept only a strict 64-character lowercase hex string (32 bytes)
+    if (!/^[0-9a-f]{64}$/.test(account)) {
+      console.warn(`ignoring GENESIS_BALANCES entry with a non-64-hex account: ${entry}`)
       continue
     }
     if (!Number.isInteger(amount) || amount < 0 || amount > Number.MAX_SAFE_INTEGER) {
