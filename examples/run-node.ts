@@ -216,7 +216,8 @@ if (rpc) {
     .ready()
     .then((bound) => {
       const surface = rpc.writesEnabled ? "POST, reads + chain_sendTransaction" : "POST, read-only"
-      console.log(`json-rpc listening on http://${rpc.host}:${bound} (${surface})`)
+      const displayHost = typeof rpc.host === "string" && rpc.host.includes(":") ? `[${rpc.host}]` : rpc.host
+      console.log(`json-rpc listening on http://${displayHost}:${bound} (${surface})`)
       console.log(`json-rpc methods: ${rpcMethodNames(rpc.writesEnabled).join(", ")}`)
     })
     .catch((err: Error) => {
