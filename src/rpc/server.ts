@@ -387,6 +387,25 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
     }
     return { supported: false }
   },
+
+  /** Report whether this node exposes a retained-chain store and what capacity it advertises. */
+  chain_store_capacity: (node: RpcNode, params: unknown) => {
+    noParams(params, "chain_store_capacity")
+    try {
+      // If the node exposes a chain store, prefer its runtime `capacity` when
+      // present; otherwise fall back to the compile-time default.
+      if (node && (node as any).chain) {
+        const cap = (node as any).chain.capacity
+        if (typeof cap === "number" && Number.isSafeInteger(cap) && cap >= 0) {
+          return { supported: true, capacity: cap }
+        }
+        return { supported: true, capacity: DEFAULT_CHAIN_STORE_CAPACITY }
+      }
+    } catch (e) {
+      // fall through to unsupported
+    }
+    return { supported: false }
+  },
   /** The height of this node's current tip. */
   chain_height: (node: RpcNode, params: unknown) => {
     noParams(params, "chain_height")
