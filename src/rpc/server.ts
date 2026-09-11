@@ -579,9 +579,13 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
       throw new RpcError(RPC_INVALID_PARAMS, 'params must be {"id": "<64-hex>"} or ["<64-hex>"]')
     }
 
-    if (typeof id !== "string" || !/^[0-9a-f]{64}$/.test(id)) {
-      throw new RpcError(RPC_INVALID_PARAMS, "id must be a 64-character lowercase hex string")
+    if (typeof id !== "string" || !/^(?:0x)?[0-9a-fA-F]{64}$/.test(id)) {
+      throw new RpcError(RPC_INVALID_PARAMS, 'id must be a 64-hex string, optionally prefixed with "0x"')
     }
+
+    // Normalize: strip optional 0x prefix and lowercase so the rest of the
+    // codebase can continue to compare canonical lowercase ids.
+    id = id.replace(/^0x/i, "").toLowerCase()
 
     // Check mempool first, if present and exposing get()
     const pool = node.mempool
