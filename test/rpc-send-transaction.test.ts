@@ -75,7 +75,7 @@ describe("chain_sendTransaction: focused behaviour tests", () => {
     }
   })
 
-  it("requires X-Write-Token when RPC_WRITE_TOKEN is set", async () => {
+  it("requires X-Write-Token or Authorization: Bearer when RPC_WRITE_TOKEN is set", async () => {
     const token = "s3cr3t"
     const old = process.env.RPC_WRITE_TOKEN
     process.env.RPC_WRITE_TOKEN = token
@@ -115,6 +115,13 @@ describe("chain_sendTransaction: focused behaviour tests", () => {
       expect(ansOk.body.result).toBeTruthy()
       expect(ansOk.body.result.admitted).toBe(true)
       expect(seenTx).toEqual(tx)
+
+      // Authorization: Bearer should also be accepted
+      const ansAuth = await call(port, "chain_sendTransaction", { transaction: tx }, 1, { "Authorization": `Bearer ${token}` })
+      expect(ansAuth.status).toBe(200)
+      expect(ansAuth.body).toBeTruthy()
+      expect(ansAuth.body.result).toBeTruthy()
+      expect(ansAuth.body.result.admitted).toBe(true)
     } finally {
       await handle.close()
       if (old === undefined) delete process.env.RPC_WRITE_TOKEN

@@ -869,11 +869,20 @@ function respond(
     : ""
   if (isWrite && envToken && envToken.length > 0 && writesAllowed) {
     // Normalise header lookup: Node lowercases incoming headers. Accept either
-    // the exact header name or the lowercased form.
+    // the legacy X-Write-Token header or the standard Authorization: Bearer <token>
+    // form. The latter is useful for proxies and clients that only expose
+    // Authorization.
     const headerVal = (() => {
       const h = reqHeaders["x-write-token"] || reqHeaders["X-Write-Token"]
       if (Array.isArray(h)) return String(h[0])
-      return typeof h === "string" ? h : undefined
+      if (typeof h === "string") return h
+      const a = reqHeaders["authorization"] || reqHeaders["Authorization"]
+      const auth = Array.isArray(a) ? String(a[0]) : typeof a === "string" ? a : undefined
+      if (typeof auth === "string") {
+        const m = auth.match(/^\s*Bearer\s+(.+)\s*$/i)
+        if (m) return m[1]
+      }
+      return undefined
     })()
     if (!headerVal || headerVal !== envToken) {
       // Missing or incorrect token: reject with HTTP 401 and a JSON-RPC error

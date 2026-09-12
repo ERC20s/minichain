@@ -184,6 +184,11 @@ can submit a **block**, so the acceptance rules in `src/node.ts` remain the only
 path onto the chain. There is no authentication and no TLS — anything beyond
 loopback belongs behind a reverse proxy.
 
+When `RPC_WRITE_TOKEN` is set in the environment, write methods require that
+secret to be presented in a request; the server accepts it either in the
+legacy `X-Write-Token` header or in the standard `Authorization: Bearer <token>`
+header.
+
 POST only (any other verb answers 405), request bodies capped at 64 KiB, no
 batch requests.
 
