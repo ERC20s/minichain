@@ -792,7 +792,8 @@ function respond(
   body: string,
   res: ServerResponse,
   writesAllowed: boolean,
-  names: string[]
+  names: string[],
+  reqHeaders: Record<string, string | string[] | undefined>
 ): void {
   let parsed: unknown
   try {
@@ -856,6 +857,40 @@ function respond(
   }
 
   const isWrite = Object.prototype.hasOwnProperty.call(RPC_WRITE_METHODS, req.method)
+
+  // If the write-token feature is enabled via RPC_WRITE_TOKEN, require the
+  // header X-Write-Token for any write method. This runs after the writesAllowed
+  // check so it only affects calls that would otherwise be permitted by the
+  // bind / RPC_ALLOW_WRITES decision. When the header is missing or wrong the
+  // request is rejected with 401 and a JSON-RPC error with data.reason =
+  // "unauthorised" so callers see why.
+  const envToken = typeof process !== "undefined" && process.env && process.env.RPC_WRITE_TOKEN !== undefined
+    ? String(process.env.RPC_WRITE_TOKEN)
+    : ""
+  if (isWrite && envToken && envToken.length > 0 && writesAllowed) {
+    // Normalise header lookup: Node lowercases incoming headers. Accept either
+    // the exact header name or the lowercased form.
+    const headerVal = (() => {
+      const h = reqHeaders["x-write-token"] || reqHeaders["X-Write-Token"]
+      if (Array.isArray(h)) return String(h[0])
+      return typeof h === "string" ? h : undefined
+    })()
+    if (!headerVal || headerVal !== envToken) {
+      // Missing or incorrect token: reject with HTTP 401 and a JSON-RPC error
+      // body that carries the RPC_METHOD_NOT_FOUND code for compatibility with
+      // existing clients that look for 32601, but the HTTP status is 401 so
+      // reverse proxies and browsers see the auth failure directly.
+      try {
+        addCorsHeaders(res)
+      } catch (e) {}
+      sendJson(
+        res,
+        401,
+        errorEnvelope(id, RPC_METHOD_NOT_FOUND, `${req.method} unauthorised`, { reason: "unauthorised" })
+      )
+      return
+    }
+  }
 
   // A write method on a bind that does not serve writes is refused HERE, with
   // its own reason, rather than falling through to "unknown method": an operator
@@ -1067,7 +1102,7 @@ function handleRequest(
       return
     }
     try {
-      respond(node, Buffer.concat(chunks).toString("utf8"), res, writesAllowed, names)
+      respond(node, Buffer.concat(chunks).toString("utf8"), res, writesAllowed, names, req.headers)
     } catch (e) {
       internalErrors++
       sendJson(res, 500, errorEnvelope(null, RPC_INTERNAL_ERROR, "internal error"))
