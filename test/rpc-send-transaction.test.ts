@@ -1,11 +1,13 @@
 import { request } from "http"
 import { startRpcServer, RPC_METHOD_NOT_FOUND } from "../src/rpc/server"
 
-function http(port: number, body: string | object, host = "127.0.0.1") {
+function http(port: number, body: string | object, host = "127.0.0.1", headers: Record<string,string|number> = {}) {
   const payload = typeof body === "string" ? body : JSON.stringify(body)
+  const requestHeaders: Record<string, any> = { "Content-Type": "application/json" }
+  for (const k of Object.keys(headers)) requestHeaders[k] = String(headers[k])
   return new Promise<{ status: number; body: any; text: string }>((resolve, reject) => {
     const req = request(
-      { host, port, method: "POST", path: "/", headers: { "Content-Type": "application/json" } },
+      { host, port, method: "POST", path: "/", headers: requestHeaders },
       (res) => {
         const chunks: Buffer[] = []
         res.on("data", (c: Buffer) => chunks.push(c))
@@ -27,10 +29,10 @@ function http(port: number, body: string | object, host = "127.0.0.1") {
   })
 }
 
-function call(port: number, method: string, params?: unknown, id: any = 1) {
+function call(port: number, method: string, params?: unknown, id: any = 1, headers: Record<string,string|number> = {}) {
   const body: Record<string, unknown> = { jsonrpc: "2.0", method, id }
   if (params !== undefined) body.params = params
-  return http(port, body)
+  return http(port, body, undefined, headers)
 }
 
 describe("chain_sendTransaction: focused behaviour tests", () => {
@@ -70,6 +72,53 @@ describe("chain_sendTransaction: focused behaviour tests", () => {
       expect(ans.body.error.data.reason).toBe("unsupported")
     } finally {
       await handle.close()
+    }
+  })
+
+  it("requires X-Write-Token when RPC_WRITE_TOKEN is set", async () => {
+    const token = "s3cr3t"
+    const old = process.env.RPC_WRITE_TOKEN
+    process.env.RPC_WRITE_TOKEN = token
+    let seenTx: any = null
+    const stub: any = {
+      tip: { height: 0 },
+      validators: [],
+      balances: { balanceOf: () => 0 },
+      nonces: { lastNonce: () => undefined },
+      submitTransaction: (tx: any) => {
+        seenTx = tx
+        return { admitted: true, id: "okid" }
+      },
+    }
+    const handle = startRpcServer(stub as any, 0)
+    const port = await handle.ready()
+    try {
+      expect(handle.writesEnabled).toBe(true)
+      const tx = { guarded: "tx" }
+      const ansMissing = await call(port, "chain_sendTransaction", { transaction: tx })
+      expect(ansMissing.status).toBe(401)
+      expect(ansMissing.body).toBeTruthy()
+      expect(ansMissing.body.error).toBeTruthy()
+      expect(ansMissing.body.error.data).toBeTruthy()
+      expect(ansMissing.body.error.data.reason).toBe("unauthorised")
+
+      const ansWrong = await call(port, "chain_sendTransaction", { transaction: tx }, 1, { "X-Write-Token": "wrong" })
+      expect(ansWrong.status).toBe(401)
+      expect(ansWrong.body).toBeTruthy()
+      expect(ansWrong.body.error).toBeTruthy()
+      expect(ansWrong.body.error.data).toBeTruthy()
+      expect(ansWrong.body.error.data.reason).toBe("unauthorised")
+
+      const ansOk = await call(port, "chain_sendTransaction", { transaction: tx }, 1, { "X-Write-Token": token })
+      expect(ansOk.status).toBe(200)
+      expect(ansOk.body).toBeTruthy()
+      expect(ansOk.body.result).toBeTruthy()
+      expect(ansOk.body.result.admitted).toBe(true)
+      expect(seenTx).toEqual(tx)
+    } finally {
+      await handle.close()
+      if (old === undefined) delete process.env.RPC_WRITE_TOKEN
+      else process.env.RPC_WRITE_TOKEN = old
     }
   })
 
