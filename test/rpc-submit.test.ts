@@ -13,6 +13,7 @@ import {
 import { transactionId } from "../src/state/mempool"
 import { Validator, publicKeyToHex } from "../src/validators"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
+import { closeAll } from "./helpers/gossip"
 
 /**
  * chain_sendTransaction: the way IN from outside the process (src/rpc/server.ts).
@@ -101,8 +102,7 @@ describe("chain_sendTransaction: the loopback write path", () => {
 
   afterAll(async () => {
     await rpc.close()
-    try { node.close() } catch (e) {}
-    await wait(50)
+    await closeAll(node)
   })
 
   it("serves the write method on a loopback bind and advertises it", () => {

@@ -4,12 +4,9 @@ import { createBlock, blockHash, Block } from "../src/block"
 import { Keypair, sign } from "../src/crypto/ed25519"
 import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { startRpcServer } from "../src/rpc/server"
 import { transactionId } from "../src/state/mempool"
-
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
-}
 
 type RpcAnswer = { status: number; body: any; text: string }
 
@@ -80,24 +77,18 @@ describe("chain_getTransaction RPC", () => {
 
   beforeAll(async () => {
     node = new Node(9216, [], genesis, validators, opening)
-    await wait(60)
     peer = new Node(9215, ["ws://127.0.0.1:9216"], genesis, [], opening)
     rpcHandle = startRpcServer(node, 0)
     rpcPort = await rpcHandle.ready()
-    await wait(120)
+    await waitForPeers(peer, { outbound: 1 }, undefined, "peer")
+    await waitForPeers(node, { inbound: 1 }, undefined, "node")
   }, 10000)
 
   afterAll(async () => {
     try {
       await rpcHandle.close()
     } catch (e) {}
-    try {
-      peer.close()
-    } catch (e) {}
-    try {
-      node.close()
-    } catch (e) {}
-    await wait(50)
+    await closeAll(peer, node)
   })
 
   it("finds a transaction in the mempool", async () => {
@@ -122,7 +113,7 @@ describe("chain_getTransaction RPC", () => {
     const blk = createBlock(blockHash(genesis), 1, [tx])
     const sig = signBlock(blk, proposer)
     peer.broadcastBlock(blk, sig, proposer.publicKey)
-    await wait(250)
+    await waitUntil(() => node.tip.height >= 1, "the node to accept the gossiped block")
 
     const id = transactionId(tx)
     const res = await call(rpcPort, "chain_getTransaction", [id])

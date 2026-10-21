@@ -5,6 +5,7 @@ import { merkleRoot } from "../src/merkle"
 import { Node } from "../src/node"
 import { signTransaction, verifyTransaction } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
@@ -75,43 +76,50 @@ describe("a node refuses a block carrying an unauthorised transaction", () => {
     expect(forgedTx.sender).toBe(accountHex(62))
   })
 
-  async function deliver(blk: Block, ports: [number, number]) {
+  /**
+   * Deliver `blk` from A to B and return B's tip. A block expected to land is
+   * waited for; one expected to be dropped is watched for a fixed 250 ms window.
+   */
+  async function deliver(blk: Block, ports: [number, number], accepted: boolean) {
     const [portA, portB] = ports
     // the honest senders are funded, so a block that is dropped below is
     // dropped for the signature, never for insolvency
     const opening = funded([62, 64])
     const nodeB = new Node(portB, [], genesis, [], opening)
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
-
-    const sig = signBlock(blk, proposer) // a genuine header signature
-    await wait(100)
-    nodeA.broadcastBlock(blk, sig, proposer.publicKey)
-    await wait(250)
-
-    const tip = nodeB.tip
-    nodeA.close(); nodeB.close()
-    await wait(20)
-    return tip
+    try {
+      const sig = signBlock(blk, proposer) // a genuine header signature
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+      nodeA.broadcastBlock(blk, sig, proposer.publicKey)
+      if (accepted) {
+        await waitUntil(() => nodeB.tip.height >= blk.height, `nodeB to accept block ${blk.height}`)
+      } else {
+        await wait(250)
+      }
+      return nodeB.tip
+    } finally {
+      await closeAll(nodeA, nodeB)
+    }
   }
 
   it("accepts a block whose transactions are all signed by their senders", async () => {
-    const tip = await deliver(honest, [9901, 9902])
+    const tip = await deliver(honest, [9901, 9902], true)
     expect(tip.height).toBe(1)
     expect(tip.transactions.length).toBe(2)
-  }, 4000)
+  }, 10000)
 
   it("drops a block containing a transaction signed by another key", async () => {
-    const tip = await deliver(forgedBlock, [9911, 9912])
+    const tip = await deliver(forgedBlock, [9911, 9912], false)
     expect(tip.height).toBe(0)
     expect(blockHash(tip)).toBe(blockHash(genesis))
-  }, 4000)
+  }, 10000)
 
   it("drops a block whose transaction was edited after signing", async () => {
-    const tip = await deliver(tamperedBlock, [9921, 9922])
+    const tip = await deliver(tamperedBlock, [9921, 9922], false)
     expect(tip.height).toBe(0)
     expect(blockHash(tip)).toBe(blockHash(genesis))
-  }, 4000)
+  }, 10000)
 
   it("drops a block carrying an unsigned transaction", async () => {
     // createBlock refuses to build this, so a forger has to assemble it by hand:
@@ -125,8 +133,8 @@ describe("a node refuses a block carrying an unauthorised transaction", () => {
     const handmade: Block = { ...honest, transactions: [unsigned] }
     expect(() => transactionLeaves(handmade.transactions)).toThrow()
 
-    const tip = await deliver(handmade, [9931, 9932])
+    const tip = await deliver(handmade, [9931, 9932], false)
     expect(tip.height).toBe(0)
     expect(blockHash(tip)).toBe(blockHash(genesis))
-  }, 4000)
+  }, 10000)
 })

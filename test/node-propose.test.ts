@@ -5,6 +5,7 @@ import { MAX_BLOCK_TRANSACTIONS, Node } from "../src/node"
 import { transactionId } from "../src/state/mempool"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
 import { accountHex, funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 /**
  * Block production (src/node.ts, Node.proposeBlock).
@@ -25,10 +26,6 @@ import { accountHex, funded, signedTx } from "./helpers/signed-tx"
  *
  * The gossip ports used below (9171-9183) are used by no other test file.
  */
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
-}
-
 function signBlock(blk: Block, keypair: Keypair): Uint8Array {
   const msg = canonicalBlockEncoding({
     parentHash: blk.parentHash,
@@ -100,8 +97,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(node.mempool.size).toBe(0)
       expect(node.mempool.has(transactionId(first))).toBe(false)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -121,8 +117,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(node.nonces.lastNonce(sender)).toBeUndefined()
       expect(node.balances.balanceOf(sender)).toBe(1000000)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -138,8 +133,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(empty!.transactions).toEqual([])
       expect(node.tip.height).toBe(1)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -158,8 +152,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(node.mempool.size).toBe(1)
       expect(MAX_BLOCK_TRANSACTIONS).toBe(256)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -176,8 +169,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(blk!.timestamp).toBe(genesis.timestamp)
       expect(node.tip.height).toBe(1)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -201,28 +193,25 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(node.tip.height).toBe(0)
       expect(node.mempool.size).toBe(1)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
   it("gossips a minted block, and a second node accepts it", async () => {
-    // B is started first: each node dials its peer once, at construction.
     const nodeB = new Node(9183, [], genesis, validators, opening, clock)
-    await wait(60)
     const nodeA = new Node(9182, [`ws://127.0.0.1:9183`], genesis, validators, opening, clock)
     try {
-      for (let i = 0; i < 40 && nodeA.peerCounts().outbound < 1; i++) await wait(50)
-      expect(nodeA.peerCounts().outbound).toBe(1)
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
 
       const tx = signedTx(81, { recipient: "carol", amount: 9, nonce: 1 })
       expect(nodeA.submitTransaction(tx).admitted).toBe(true)
-      for (let i = 0; i < 40 && nodeB.mempool.size < 1; i++) await wait(50)
+      await waitUntil(() => nodeB.mempool.size >= 1, "nodeB to pool the gossiped transaction")
       expect(nodeB.mempool.size).toBe(1)
 
       const minted = nodeA.proposeBlock(proposer.secretKey, proposer.publicKey)
       expect(minted).not.toBeNull()
-      for (let i = 0; i < 40 && nodeB.tip.height < 1; i++) await wait(50)
+      await waitUntil(() => nodeB.tip.height >= 1, "nodeB to accept the minted block")
 
       expect(nodeB.tip.height).toBe(1)
       expect(blockHash(nodeB.tip)).toBe(blockHash(minted!))
@@ -232,9 +221,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
       expect(nodeB.mempool.has(transactionId(tx))).toBe(false)
       expect(nodeB.mempool.size).toBe(0)
     } finally {
-      nodeA.close()
-      nodeB.close()
-      await wait(20)
+      await closeAll(nodeA, nodeB)
     }
   }, 15000)
 })
@@ -342,8 +329,7 @@ describe("Node.proposeBlock skips a pending transaction that cannot stage", () =
       expect(node.mempool.size).toBe(1)
       expect(node.mempool.has(transactionId(stuck))).toBe(true)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -375,8 +361,7 @@ describe("Node.proposeBlock skips a pending transaction that cannot stage", () =
       expect(node.mempool.has(transactionId(stuck))).toBe(false)
       expect(node.mempool.size).toBe(0)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 })

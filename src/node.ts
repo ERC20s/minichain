@@ -787,7 +787,12 @@ export class Node {
     this.gossip.broadcast("blk", payload, sig && pubKey ? { sig, pubKey } : undefined)
   }
 
-  close() {
-    try { this.gossip.close() } catch (e) {}
+  /** Close the gossip transport; resolves once its server and sockets are closed. */
+  close(): Promise<void> {
+    try {
+      return this.gossip.close()
+    } catch (e) {
+      return Promise.resolve()
+    }
   }
 }

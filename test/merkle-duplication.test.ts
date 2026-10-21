@@ -5,6 +5,7 @@ import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { merkleRoot } from "../src/merkle"
 import { Transaction } from "../src/types/transaction"
 import { funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers } from "./helpers/gossip"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -71,30 +72,34 @@ describe("a padded transaction list cannot forge a block", () => {
     // its Merkle root and not for an unaffordable transfer
     const opening = funded([1, 2, 3])
     const nodeB = new Node(portB, [], genesis, [], opening)
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
     const sig = signBlock(honest, proposer) // header signature, identical for both blocks
-    await wait(100)
-    nodeA.broadcastBlock(blk, sig, proposer.publicKey)
-    await wait(250)
+    try {
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+      nodeA.broadcastBlock(blk, sig, proposer.publicKey)
+      // Up to 1.5s for B to take it: an accepted block ends the wait early, a
+      // rejected one is watched for the whole window.
+      const deadline = Date.now() + 1500
+      while (nodeB.tip.height < 1 && Date.now() < deadline) await wait(25)
 
-    const tip = nodeB.tip
-    nodeA.close(); nodeB.close()
-    await wait(20)
-    return tip
+      return nodeB.tip
+    } finally {
+      await closeAll(nodeA, nodeB)
+    }
   }
 
   it("a node accepts the honest block", async () => {
     const tip = await deliver(honest, [9701, 9702])
     expect(tip.height).toBe(1)
     expect(tip.transactions.length).toBe(3)
-  }, 4000)
+  }, 10000)
 
   it("a node rejects the padded block and keeps its tip", async () => {
     const tip = await deliver(padded, [9711, 9712])
     expect(tip.height).toBe(0)
     expect(tip.transactions.length).toBe(0)
     expect(blockHash(tip)).toBe(blockHash(genesis))
-  }, 4000)
+  }, 10000)
 })

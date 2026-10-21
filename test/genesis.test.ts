@@ -9,6 +9,7 @@ import { Keypair, keypairFromSeed } from "../src/crypto/ed25519"
 import { Node } from "../src/node"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
 import { accountHex, funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 /**
  * The fixed genesis block (src/block.ts, createGenesisBlock).
@@ -110,12 +111,13 @@ describe("two nodes built from their OWN genesis share one chain", () => {
     const clock = Date.now()
     const genesisB = createGenesisBlock()
     const nodeB = new Node(9191, [], genesisB, validators, opening, { now: () => clock })
-    await wait(60)
     const genesisA = createGenesisBlock()
     const nodeA = new Node(9192, ["ws://127.0.0.1:9191"], genesisA, validators, opening, { now: () => clock })
-    await wait(120)
 
     try {
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+
       // The two nodes never shared an object, yet they must hold one tip.
       expect(blockHash(nodeA.tip)).toBe(blockHash(nodeB.tip))
 
@@ -128,12 +130,12 @@ describe("two nodes built from their OWN genesis share one chain", () => {
 
       const tx = signedTx(81, { recipient: "carol", amount: 9, nonce: 1 })
       expect(nodeA.submitTransaction(tx).admitted).toBe(true)
-      await wait(200)
+      await waitUntil(() => nodeB.mempool.size >= 1, "nodeB to pool the gossiped tx")
 
       const minted = nodeA.proposeBlock(proposer.secretKey, proposer.publicKey)
       expect(minted).not.toBeNull()
       expect(minted!.parentHash).toBe(blockHash(genesisB))
-      await wait(300)
+      await waitUntil(() => nodeB.tip.height >= 1, "nodeB to accept the minted block")
 
       // The assertion the old code could never satisfy: B, built from ITS own
       // genesis, took A's block instead of silently staying at height 0.
@@ -142,9 +144,7 @@ describe("two nodes built from their OWN genesis share one chain", () => {
       expect(nodeB.balances.balanceOf(sender)).toBe(1000000 - 9)
       expect(nodeB.nonces.lastNonce(sender)).toBe(1)
     } finally {
-      nodeA.close()
-      nodeB.close()
-      await wait(20)
+      await closeAll(nodeA, nodeB)
     }
   }, 15000)
 })

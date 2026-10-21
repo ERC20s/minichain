@@ -3,6 +3,7 @@ import { keypairFromSeed, sign, Keypair } from "../src/crypto/ed25519"
 import { blockHash, createBlock, Block } from "../src/block"
 import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers } from "./helpers/gossip"
 
 /**
  * Block timestamp bounds (src/node.ts).
@@ -61,7 +62,6 @@ describe("Node bounds block timestamps", () => {
     // or the block would be dropped for insolvency and hide what is tested here.
     const opening = funded([13])
     const nodeC = new Node(portC, [], genesis, [], opening)
-    await wait(60)
     const nodeB = new Node(
       portB,
       [`ws://127.0.0.1:${portC}`],
@@ -70,7 +70,6 @@ describe("Node bounds block timestamps", () => {
       opening,
       { now: () => BASE, ...(options || {}) }
     )
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
     const blk = createBlock(blockHash(genesis), 1, [
@@ -89,21 +88,18 @@ describe("Node bounds block timestamps", () => {
     try {
       // Broadcast only once both links on the path are open, so a slow dial under
       // a loaded test run cannot pass for "not propagated".
-      for (let i = 0; i < 40; i++) {
-        if (nodeA.peerCounts().outbound > 0 && nodeB.peerCounts().outbound > 0) break
-        await wait(50)
-      }
-      expect(nodeA.peerCounts().outbound).toBe(1)
-      expect(nodeB.peerCounts().outbound).toBe(1)
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
+      await waitForPeers(nodeC, { inbound: 1 }, undefined, "nodeC")
       nodeA.broadcastBlock(blk, sig, proposer.publicKey)
       // Up to 1.5s for C to hear it: a relayed block ends the wait early, a
       // dropped one is watched for the whole window.
-      for (let i = 0; i < 30 && nodeC.tip.height < 1; i++) await wait(50)
+      const deadline = Date.now() + 1500
+      while (nodeC.tip.height < 1 && Date.now() < deadline) await wait(25)
 
       return { b: nodeB.tip, c: nodeC.tip }
     } finally {
-      nodeA.close(); nodeB.close(); nodeC.close()
-      await wait(20)
+      await closeAll(nodeA, nodeB, nodeC)
     }
   }
 
@@ -144,13 +140,15 @@ describe("Node bounds block timestamps", () => {
     expect(tips.c.height).toBe(0)
   }, 10000)
 
-  it("keeps the default drift when the option is missing or unusable", () => {
+  it("keeps the default drift when the option is missing or unusable", async () => {
     const node = new Node(9071, [], genesis, [], undefined, { maxFutureDriftMs: -1 })
-    expect(node.maxFutureDriftMs).toBe(MAX_FUTURE_DRIFT_MS)
-    node.close()
     const other = new Node(9072, [], genesis)
-    expect(other.maxFutureDriftMs).toBe(MAX_FUTURE_DRIFT_MS)
-    expect(typeof other.now()).toBe("number")
-    other.close()
+    try {
+      expect(node.maxFutureDriftMs).toBe(MAX_FUTURE_DRIFT_MS)
+      expect(other.maxFutureDriftMs).toBe(MAX_FUTURE_DRIFT_MS)
+      expect(typeof other.now()).toBe("number")
+    } finally {
+      await closeAll(node, other)
+    }
   })
 })

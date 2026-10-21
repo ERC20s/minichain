@@ -2,6 +2,7 @@ import { Block, blockHash, createGenesisBlock } from "../src/block"
 import { Keypair, keypairFromSeed } from "../src/crypto/ed25519"
 import { MAX_SYNC_BLOCKS, Node, SYNC_REQUEST_INTERVAL_MS } from "../src/node"
 import { ChainStore, DEFAULT_CHAIN_STORE_CAPACITY } from "../src/state/chain"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 /**
@@ -94,7 +95,9 @@ describe("a node catches up over gossip", () => {
       // height 1 the moment its link to A opens (see "Reconnecting peers" in
       // the README), and A answers 1, 2 and 3 to B alone — nothing new minted.
       b = new Node(9252, ["ws://127.0.0.1:9251"], genesis, [], opening)
-      for (let i = 0; i < 30 && b.tip.height < 3; i++) await wait(100)
+      await waitForPeers(b, { outbound: 1 }, undefined, "b")
+      const late = b
+      await waitUntil(() => late.tip.height >= 3, "b to catch up to height 3")
       expect(b.tip.height).toBe(3)
       expect(blockHash(b.tip)).toBe(blockHash(a.tip))
 
@@ -103,7 +106,7 @@ describe("a node catches up over gossip", () => {
         a.submitTransaction(signedTx(81, { recipient: "carol", amount: 1, nonce: 4 })).admitted
       ).toBe(true)
       expect(a.proposeBlock(proposer.secretKey, proposer.publicKey)).not.toBeNull()
-      for (let i = 0; i < 30 && b.tip.height < 4; i++) await wait(100)
+      await waitUntil(() => late.tip.height >= 4, "b to follow block 4")
 
       expect(b.tip.height).toBe(4)
       expect(blockHash(b.tip)).toBe(blockHash(a.tip))
@@ -114,9 +117,7 @@ describe("a node catches up over gossip", () => {
       expect(b.chain.has(1)).toBe(true)
       expect(b.chain.has(4)).toBe(true)
     } finally {
-      if (b) b.close()
-      a.close()
-      await wait(20)
+      await closeAll(b, a)
     }
   }, 20000)
 
@@ -150,7 +151,7 @@ describe("a node catches up over gossip", () => {
 
       // ask for more than the cap allows
       ws.send(envelope("req", { from: 1, max: 100 }))
-      await wait(400)
+      await waitUntil(() => seen.length >= MAX_SYNC_BLOCKS, `${MAX_SYNC_BLOCKS} blk answers`)
 
       expect(seen.length).toBe(MAX_SYNC_BLOCKS)
       const heights = seen.map((env) => decodePayload(env).height)
@@ -166,7 +167,7 @@ describe("a node catches up over gossip", () => {
       // a smaller window is honoured
       seen.length = 0
       ws.send(envelope("req", { from: 5, max: 2 }))
-      await wait(300)
+      await waitUntil(() => seen.length >= 2, "2 blk answers")
       expect(seen.map((env) => decodePayload(env).height)).toEqual([5, 6])
 
       // a height this node does not hold is answered with nothing at all
@@ -182,8 +183,7 @@ describe("a node catches up over gossip", () => {
       expect(seen.length).toBe(0)
     } finally {
       if (ws) try { ws.close() } catch (e) {}
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 15000)
 
@@ -212,8 +212,7 @@ describe("a node catches up over gossip", () => {
         max: MAX_SYNC_BLOCKS,
       })
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -241,15 +240,14 @@ describe("a node catches up over gossip", () => {
 
       // height 7 is above the gap: this node cannot use it and now says so.
       ws.send(envelope("blk", junkBlock(7)))
-      await wait(300)
+      await waitUntil(() => asked.length >= 1, "a req for the gap")
       expect(asked.length).toBe(1)
       expect(asked[0]).toEqual({ from: 1, max: MAX_SYNC_BLOCKS })
       // and nothing about the tip or the ledgers moved on an unaccepted block
       expect(node.tip.height).toBe(0)
     } finally {
       if (ws) try { ws.close() } catch (e) {}
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 10000)
 })

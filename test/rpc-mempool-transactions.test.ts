@@ -8,10 +8,7 @@ import {
   rpcMethodNames,
 } from "../src/rpc/server"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
-
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
-}
+import { closeAll, waitForPeers } from "./helpers/gossip"
 
 type RpcAnswer = { status: number; body: any; text: string }
 
@@ -82,18 +79,16 @@ describe("chain_mempool includeTransactions", () => {
 
   beforeAll(async () => {
     node = new Node(9214, [], genesis, validators, opening)
-    await wait(60)
     peer = new Node(9213, ["ws://127.0.0.1:9214"], genesis, [], opening)
     rpc = startRpcServer(node, 0)
     rpcPort = await rpc.ready()
-    await wait(120)
+    await waitForPeers(peer, { outbound: 1 }, undefined, "peer")
+    await waitForPeers(node, { inbound: 1 }, undefined, "node")
   }, 10000)
 
   afterAll(async () => {
     await rpc.close()
-    try { peer.close() } catch (e) {}
-    try { node.close() } catch (e) {}
-    await wait(50)
+    await closeAll(peer, node)
   })
 
   it("default returns ids only and still forbids params", async () => {

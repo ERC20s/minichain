@@ -10,6 +10,7 @@ import { merkleRoot } from "../src/merkle"
 import { TransactionSignatureError } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
 import { funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers } from "./helpers/gossip"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -128,27 +129,31 @@ describe("merkle leaves are canonical transaction bytes", () => {
       // leaves and not on whether the transfers are affordable
       const opening = funded([1, 2, 3])
       const nodeB = new Node(portB, [], genesis, [], opening)
-      await wait(60)
       const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
       // the header signature is over the HONEST header, which every variant
       // below shares, so only the recomputed leaves can tell them apart
       const sig = signBlock(honest, proposer)
-      await wait(100)
-      nodeA.broadcastBlock(blk, sig, proposer.publicKey)
-      await wait(250)
+      try {
+        await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+        await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+        nodeA.broadcastBlock(blk, sig, proposer.publicKey)
+        // Up to 1.5s for B to take it: an accepted block ends the wait early, a
+        // rejected one is watched for the whole window.
+        const deadline = Date.now() + 1500
+        while (nodeB.tip.height < 1 && Date.now() < deadline) await wait(25)
 
-      const tip = nodeB.tip
-      nodeA.close(); nodeB.close()
-      await wait(20)
-      return tip
+        return nodeB.tip
+      } finally {
+        await closeAll(nodeA, nodeB)
+      }
     }
 
     it("accepts an honest block", async () => {
       const tip = await deliver(honest, [9801, 9802])
       expect(tip.height).toBe(1)
       expect(tip.transactions.length).toBe(3)
-    }, 4000)
+    }, 10000)
 
     it("drops a block whose transaction carries an extra field and keeps its tip", async () => {
       const tampered: Block = {
@@ -160,7 +165,7 @@ describe("merkle leaves are canonical transaction bytes", () => {
       const tip = await deliver(tampered, [9811, 9812])
       expect(tip.height).toBe(0)
       expect(blockHash(tip)).toBe(blockHash(genesis))
-    }, 4000)
+    }, 10000)
 
     it("drops a block committing to a NaN amount and keeps its tip", async () => {
       const tampered: Block = {
@@ -177,6 +182,6 @@ describe("merkle leaves are canonical transaction bytes", () => {
       const tip = await deliver(tampered, [9821, 9822])
       expect(tip.height).toBe(0)
       expect(blockHash(tip)).toBe(blockHash(genesis))
-    }, 4000)
+    }, 10000)
   })
 })

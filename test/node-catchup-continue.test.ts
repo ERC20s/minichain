@@ -1,6 +1,7 @@
 import { blockHash, createGenesisBlock } from "../src/block"
 import { Keypair, keypairFromSeed } from "../src/crypto/ed25519"
 import { MAX_SYNC_BLOCKS, Node } from "../src/node"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { funded } from "./helpers/signed-tx"
 
 /**
@@ -92,10 +93,12 @@ describe("a node keeps asking until the gap is closed", () => {
       b = new Node(9272, ["ws://127.0.0.1:9271"], genesis, [], opening)
       const asked = watchRequests(b)
       expect(b.tip.height).toBe(0)
+      const late = b
+      await waitForPeers(late, { outbound: 1 }, undefined, "b")
 
       // Nothing is minted from here on: the only thing that can move B is its
       // own asking.
-      for (let i = 0; i < 60 && b.tip.height < 70; i++) await wait(100)
+      await waitUntil(() => late.tip.height >= 70, "b to catch up to height 70", 20000)
 
       expect(a.tip.height).toBe(70)
       expect(b.tip.height).toBe(70)
@@ -114,9 +117,7 @@ describe("a node keeps asking until the gap is closed", () => {
       await wait(400)
       expect(asked.length).toBe(3)
     } finally {
-      if (b) b.close()
-      a.close()
-      await wait(20)
+      await closeAll(b, a)
     }
   }, 30000)
 
@@ -134,8 +135,10 @@ describe("a node keeps asking until the gap is closed", () => {
 
       b = new Node(9274, ["ws://127.0.0.1:9273"], genesis, [], opening)
       const asked = watchRequests(b)
+      const late = b
+      await waitForPeers(late, { outbound: 1 }, undefined, "b")
 
-      for (let i = 0; i < 30 && b.tip.height < 5; i++) await wait(100)
+      await waitUntil(() => late.tip.height >= 5, "b to catch up to height 5")
       expect(b.tip.height).toBe(5)
 
       // One request, and no follow-up: a batch shorter than the cap means the
@@ -146,14 +149,12 @@ describe("a node keeps asking until the gap is closed", () => {
       // An ordinary gossiped block that moves the tip is not a catch-up batch
       // and must not make this node ask anyone for anything.
       mintEmpty(a, proposer, 1)
-      for (let i = 0; i < 20 && b.tip.height < 6; i++) await wait(100)
+      await waitUntil(() => late.tip.height >= 6, "b to follow block 6")
       expect(b.tip.height).toBe(6)
       expect(blockHash(b.tip)).toBe(blockHash(a.tip))
       expect(asked.length).toBe(1)
     } finally {
-      if (b) b.close()
-      a.close()
-      await wait(20)
+      await closeAll(b, a)
     }
   }, 20000)
 })

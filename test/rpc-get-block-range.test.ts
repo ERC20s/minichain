@@ -10,10 +10,7 @@ import {
   startRpcServer,
 } from "../src/rpc/server"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
-
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
-}
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 type RpcAnswer = { status: number; body: any; text: string }
 
@@ -84,18 +81,16 @@ describe("chain_getBlockRange RPC", () => {
 
   beforeAll(async () => {
     node = new Node(9212, [], genesis, validators, opening)
-    await wait(60)
     peer = new Node(9211, ["ws://127.0.0.1:9212"], genesis, [], opening)
     rpc = startRpcServer(node, 0)
     port = await rpc.ready()
-    await wait(120)
+    await waitForPeers(peer, { outbound: 1 }, undefined, "peer")
+    await waitForPeers(node, { inbound: 1 }, undefined, "node")
   }, 10000)
 
   afterAll(async () => {
     await rpc.close()
-    try { peer.close() } catch (e) {}
-    try { node.close() } catch (e) {}
-    await wait(50)
+    await closeAll(peer, node)
   })
 
   it("returns multiple consecutive blocks when held", async () => {
@@ -103,7 +98,7 @@ describe("chain_getBlockRange RPC", () => {
     const blk2 = createBlock(blockHash(blk1), 2, [signedTx(21, { recipient: 'carol', amount: 5, nonce: 8 })])
     peer.broadcastBlock(blk1, signBlock(blk1, proposer), proposer.publicKey)
     peer.broadcastBlock(blk2, signBlock(blk2, proposer), proposer.publicKey)
-    await wait(300)
+    await waitUntil(() => node.tip.height >= 2, "the node to accept both gossiped blocks")
 
     const res = await call(port, "chain_getBlockRange", { from: 1, max: 2 })
     expect(res.status).toBe(200)

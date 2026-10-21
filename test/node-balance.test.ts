@@ -5,6 +5,7 @@ import { Node } from "../src/node"
 import { BalanceLedger } from "../src/state/balances"
 import { verifyTransaction } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { account, accountHex, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
@@ -156,20 +157,32 @@ describe("a node drops a block it cannot pay for", () => {
   async function session(ports: [number, number]) {
     const [portA, portB] = ports
     const nodeB = new Node(portB, [], genesis, [], opening)
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
-    await wait(100)
+    try {
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+    } catch (e) {
+      await closeAll(nodeA, nodeB)
+      throw e
+    }
     return {
       balances: () => nodeB.balances,
-      /** Broadcast `blk` with a genuine header signature; return B's tip. */
-      async send(blk: Block): Promise<Block> {
+      /**
+       * Broadcast `blk` with a genuine header signature; return B's tip. A block
+       * expected to land is waited for; one expected to be dropped is watched
+       * for a fixed 250 ms window.
+       */
+      async send(blk: Block, accepted: boolean): Promise<Block> {
         nodeA.broadcastBlock(blk, signBlock(blk, proposer), proposer.publicKey)
-        await wait(250)
+        if (accepted) {
+          await waitUntil(() => nodeB.tip.height >= blk.height, `nodeB to accept block ${blk.height}`)
+        } else {
+          await wait(250)
+        }
         return nodeB.tip
       },
       async close() {
-        nodeA.close(); nodeB.close()
-        await wait(20)
+        await closeAll(nodeA, nodeB)
       },
     }
   }
@@ -178,7 +191,7 @@ describe("a node drops a block it cannot pay for", () => {
     const s = await session([9401, 9402])
     try {
       const first = createBlock(blockHash(genesis), 1, [spendFour])
-      const tip = await s.send(first)
+      const tip = await s.send(first, true)
       expect(tip.height).toBe(1)
       expect(s.balances().balanceOf(alice)).toBe(6)
       expect(s.balances().balanceOf(bob)).toBe(4)
@@ -191,7 +204,7 @@ describe("a node drops a block it cannot pay for", () => {
     const s = await session([9411, 9412])
     try {
       const blk = createBlock(blockHash(genesis), 1, [spendAHundred])
-      const tip = await s.send(blk)
+      const tip = await s.send(blk, false)
       expect(tip.height).toBe(0)
       expect(blockHash(tip)).toBe(blockHash(genesis))
       // nothing was written: the sender still holds its opening balance
@@ -206,7 +219,7 @@ describe("a node drops a block it cannot pay for", () => {
     const s = await session([9421, 9422])
     try {
       const blk = createBlock(blockHash(genesis), 1, [fromNothing])
-      const tip = await s.send(blk)
+      const tip = await s.send(blk, false)
       expect(tip.height).toBe(0)
       expect(s.balances().balanceOf(bob)).toBe(0)
     } finally {
@@ -223,7 +236,7 @@ describe("a node drops a block it cannot pay for", () => {
         spendFour,
         signedTx(85, { recipient: bob, amount: 7, nonce: 2 }),
       ])
-      const tip = await s.send(overdraft)
+      const tip = await s.send(overdraft, false)
       expect(tip.height).toBe(0)
       expect(s.balances().balanceOf(alice)).toBe(10)
     } finally {
@@ -235,15 +248,15 @@ describe("a node drops a block it cannot pay for", () => {
     const s = await session([9441, 9442])
     try {
       const first = createBlock(blockHash(genesis), 1, [spendFour])
-      let tip = await s.send(first)
+      let tip = await s.send(first, true)
       expect(tip.height).toBe(1)
 
       const broke = createBlock(blockHash(first), 2, [spendAHundred])
-      tip = await s.send(broke)
+      tip = await s.send(broke, false)
       expect(tip.height).toBe(1) // dropped, and no balance was written
 
       const good = createBlock(blockHash(first), 2, [spendSix])
-      tip = await s.send(good)
+      tip = await s.send(good, true)
       expect(tip.height).toBe(2)
       expect(blockHash(tip)).toBe(blockHash(good))
       expect(s.balances().balanceOf(alice)).toBe(0)
