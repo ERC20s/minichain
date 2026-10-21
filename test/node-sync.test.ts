@@ -2,8 +2,7 @@ import { Node } from "../src/node"
 import { keypairFromSeed, sign } from "../src/crypto/ed25519"
 import { blockHash, createBlock } from "../src/block"
 import { funded, signedTx } from "./helpers/signed-tx"
-
-function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 describe("in-memory Node syncing over gossip", () => {
   it("propagates and validates a signed block between two nodes", async () => {
@@ -44,19 +43,22 @@ describe("in-memory Node syncing over gossip", () => {
     const msg = canonicalBlockEncoding(header as any)
     const sig = sign(msg, kp.secretKey)
 
-    // give servers a moment to start
-    await wait(50)
+    try {
+      // Broadcast only once both links are open. A dials B before B listens, so
+      // A's link comes up on a re-dial, after the backoff, not at once.
+      await waitForPeers(nodeA, { inbound: 1, outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
 
-    nodeA.broadcastBlock(blk, sig, kp.publicKey)
+      nodeA.broadcastBlock(blk, sig, kp.publicKey)
 
-    await wait(200)
+      // B accepts the block and relays it, which is how A's own tip moves.
+      await waitUntil(() => nodeA.tip.height >= 1 && nodeB.tip.height >= 1, "both tips to reach height 1")
 
-    // close nodes
-    nodeA.close()
-    nodeB.close()
-
-    expect(nodeA.tip.height).toBe(1)
-    expect(nodeB.tip.height).toBe(1)
-    expect(nodeA.tip.merkleRoot).toEqual(nodeB.tip.merkleRoot)
-  }, 2000)
+      expect(nodeA.tip.height).toBe(1)
+      expect(nodeB.tip.height).toBe(1)
+      expect(nodeA.tip.merkleRoot).toEqual(nodeB.tip.merkleRoot)
+    } finally {
+      await closeAll(nodeA, nodeB)
+    }
+  }, 15000)
 })

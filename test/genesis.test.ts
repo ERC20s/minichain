@@ -9,6 +9,7 @@ import { Keypair, keypairFromSeed } from "../src/crypto/ed25519"
 import { Node } from "../src/node"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
 import { accountHex, funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 /**
  * The fixed genesis block (src/block.ts, createGenesisBlock).
@@ -104,30 +105,37 @@ describe("two nodes built from their OWN genesis share one chain", () => {
 
   it("accepts a minted block over real gossip", async () => {
     // Each node builds its own genesis object, as two separate processes do.
+    // Both clocks are pinned: genesis is stamped 0, so the proposer round of
+    // height 1 is derived from "now", and a wall clock crossing a slot boundary
+    // mid-test would elect someone else.
+    const clock = Date.now()
     const genesisB = createGenesisBlock()
-    const nodeB = new Node(9191, [], genesisB, validators, opening)
-    await wait(60)
+    const nodeB = new Node(9191, [], genesisB, validators, opening, { now: () => clock })
     const genesisA = createGenesisBlock()
-    const nodeA = new Node(9192, ["ws://127.0.0.1:9191"], genesisA, validators, opening)
-    await wait(120)
+    const nodeA = new Node(9192, ["ws://127.0.0.1:9191"], genesisA, validators, opening, { now: () => clock })
 
     try {
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+
       // The two nodes never shared an object, yet they must hold one tip.
       expect(blockHash(nodeA.tip)).toBe(blockHash(nodeB.tip))
 
-      // Who may propose height 1 is fixed by that shared tip.
-      const elected = selectValidator(validators, proposerSeed(genesisA))
-      expect(elected).toBe(selectValidator(validators, proposerSeed(genesisB)))
+      // Who may propose height 1 is fixed by that shared tip and the round.
+      const round = nodeA.proposerRound(clock)
+      expect(nodeB.proposerRound(clock)).toBe(round)
+      const elected = selectValidator(validators, proposerSeed(genesisA, round))
+      expect(elected).toBe(selectValidator(validators, proposerSeed(genesisB, round)))
       const proposer = publicKeyToHex(alice.publicKey) === elected ? alice : bob
 
       const tx = signedTx(81, { recipient: "carol", amount: 9, nonce: 1 })
       expect(nodeA.submitTransaction(tx).admitted).toBe(true)
-      await wait(200)
+      await waitUntil(() => nodeB.mempool.size >= 1, "nodeB to pool the gossiped tx")
 
       const minted = nodeA.proposeBlock(proposer.secretKey, proposer.publicKey)
       expect(minted).not.toBeNull()
       expect(minted!.parentHash).toBe(blockHash(genesisB))
-      await wait(300)
+      await waitUntil(() => nodeB.tip.height >= 1, "nodeB to accept the minted block")
 
       // The assertion the old code could never satisfy: B, built from ITS own
       // genesis, took A's block instead of silently staying at height 0.
@@ -136,9 +144,7 @@ describe("two nodes built from their OWN genesis share one chain", () => {
       expect(nodeB.balances.balanceOf(sender)).toBe(1000000 - 9)
       expect(nodeB.nonces.lastNonce(sender)).toBe(1)
     } finally {
-      nodeA.close()
-      nodeB.close()
-      await wait(20)
+      await closeAll(nodeA, nodeB)
     }
   }, 15000)
 })

@@ -68,7 +68,12 @@ export type GossipNode = {
    * outbound client sockets that are currently open, and their sum.
    */
   peerCounts: () => { inbound: number; outbound: number; total: number }
-  close: () => void
+  /**
+   * Stop listening, stop re-dialling and close every socket. The returned
+   * promise settles once the server and every socket have actually closed, so a
+   * caller can wait for the ports to be free; it never rejects.
+   */
+  close: () => Promise<void>
 }
 
 /**
@@ -333,7 +338,17 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
     if (typeof cb === "function") peerOpenListeners.push(cb)
   }
 
-  function close() {
+  // Settles when `ws` has closed: at once if it already has, else on its own
+  // "close" event, which follows close() on an open or a still-dialling socket.
+  function closeSocket(ws: WebSocket): Promise<void> {
+    if (ws.readyState === WebSocket.CLOSED) return Promise.resolve()
+    return new Promise<void>((resolve) => {
+      ws.once("close", () => resolve())
+      try { ws.close() } catch (e) { resolve() }
+    })
+  }
+
+  function close(): Promise<void> {
     // Set FIRST: every close below fires a "close" event, and without the flag
     // each one would schedule the re-dial this call is meant to stop.
     closed = true
@@ -341,14 +356,19 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
       try { clearTimeout(t) } catch (e) {}
     }
     reconnectTimers.clear()
-    try {
-      server.close()
-    } catch (e) {}
-    for (const c of peerSockets) try { c.close() } catch (e) {}
-    for (const c of clients) try { c.close() } catch (e) {}
-    for (const s of sockets) try { s.close() } catch (e) {}
+    const done: Promise<void>[] = [
+      new Promise<void>((resolve) => {
+        try {
+          server.close(() => resolve())
+        } catch (e) {
+          resolve()
+        }
+      }),
+    ]
+    for (const ws of new Set([...peerSockets, ...clients, ...sockets])) done.push(closeSocket(ws))
     clients.clear()
     peerSockets.clear()
+    return Promise.all(done).then(() => undefined)
   }
 
   function peerCounts() {

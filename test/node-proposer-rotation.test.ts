@@ -11,6 +11,7 @@ import {
   selectValidator,
 } from "../src/validators"
 import { funded, signedTx } from "./helpers/signed-tx"
+import { closeAll } from "./helpers/gossip"
 
 /**
  * Proposer rotation by time slot (src/validators.ts proposerSeed(parent, round),
@@ -38,10 +39,6 @@ import { funded, signedTx } from "./helpers/signed-tx"
  * Every clock here is injected (NodeOptions.now), so nothing waits for real
  * time. The gossip ports used below (9281-9284) are used by no other test file.
  */
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
-}
-
 function kp(seedByte: number): Keypair {
   const seed = new Uint8Array(32)
   seed[0] = seedByte
@@ -144,8 +141,7 @@ describe("Proposer rotation by time slot", () => {
       expect(node.proposerRound(T0 - 60000)).toBe(0)
       expect(node.proposerRound(Number.NaN)).toBe(0)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -176,8 +172,7 @@ describe("Proposer rotation by time slot", () => {
       // ...and the round-0 winner is no longer entitled to that same height.
       expect(node.mempool.size).toBe(0)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -199,8 +194,7 @@ describe("Proposer rotation by time slot", () => {
       expect(node.tip.height).toBe(1)
       expect(blockHash(node.tip)).toBe(blockHash(blk!))
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 
@@ -232,8 +226,7 @@ describe("Proposer rotation by time slot", () => {
       expect(node.tip.timestamp).toBe(stampR)
       expect(node.nonces.lastNonce(tx.sender)).toBe(1)
     } finally {
-      node.close()
-      await wait(20)
+      await closeAll(node)
     }
   }, 8000)
 })

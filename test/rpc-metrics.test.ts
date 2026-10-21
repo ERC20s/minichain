@@ -71,12 +71,13 @@ describe("GET /metrics probe", () => {
       expect(first.body.mempoolEnabled).toBe(true)
       expect(first.body.mempoolSize).toBe(0)
 
-      // POST a normal RPC call and ensure requestsHandled increments by 1 only
+      // POST a normal RPC call and ensure it is counted once: between the two
+      // snapshots sit exactly two requests, the POST and the second GET /metrics.
       const before = first.body.requestsHandled
       const rpc = await call(port, "chain_height")
       expect(rpc.status).toBe(200)
       const after = (await httpGet(port, "/metrics")).body.requestsHandled
-      expect(after - before).toBe(1)
+      expect(after - before).toBe(2)
 
       // A GET /metrics itself also increments requestsHandled by 1
       const again = await httpGet(port, "/metrics")

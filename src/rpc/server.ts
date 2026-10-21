@@ -345,18 +345,17 @@ export function isLoopbackHost(host: string): boolean {
       // Exact IPv6 loopback
       if (h === "::1" || h === "0:0:0:0:0:0:0:1") return true
 
-      // IPv4-mapped IPv6: ::ffff:127.0.0.1 or ::ffff:7f000001 (32-bit hex)
+      // IPv4-mapped IPv6: ::ffff:127.0.0.1 or ::ffff:7f00:1 (two hex groups)
       if (h.startsWith("::ffff:")) {
         const tail = h.slice("::ffff:".length)
         // dotted notation
         if (isIP(tail) === 4) {
           return tail.startsWith("127.")
         }
-        // 32-bit hex form like 7f000001
-        if (/^[0-9a-f]{1,8}$/.test(tail)) {
-          const val = parseInt(tail, 16)
-          if (!Number.isFinite(val)) return false
-          const b1 = (val >>> 24) & 0xff
+        // hex form like 7f00:1 — the high group carries the first two octets
+        const groups = /^([0-9a-f]{1,4}):[0-9a-f]{1,4}$/.exec(tail)
+        if (groups) {
+          const b1 = (parseInt(groups[1], 16) >>> 8) & 0xff
           // b1 is the IPv4 first octet
           return b1 === 127
         }
@@ -644,23 +643,23 @@ export const RPC_METHODS: Readonly<Record<string, RpcMethod>> = Object.freeze({
   */
   chain_getTransaction: (node: RpcNode, params: unknown) => {
     // param parsing: accept positional [id] or named {id}
-    let id: unknown
+    let rawId: unknown
     if (Array.isArray(params)) {
       if (params.length !== 1) throw new RpcError(RPC_INVALID_PARAMS, "expected exactly one positional parameter: the transaction id")
-      id = params[0]
+      rawId = params[0]
     } else if (params && typeof params === "object") {
-      id = (params as Record<string, unknown>).id
+      rawId = (params as Record<string, unknown>).id
     } else {
       throw new RpcError(RPC_INVALID_PARAMS, 'params must be {"id": "<64-hex>"} or ["<64-hex>"]')
     }
 
-    if (typeof id !== "string" || !/^(?:0x)?[0-9a-fA-F]{64}$/.test(id)) {
+    if (typeof rawId !== "string" || !/^(?:0x)?[0-9a-fA-F]{64}$/.test(rawId)) {
       throw new RpcError(RPC_INVALID_PARAMS, 'id must be a 64-hex string, optionally prefixed with "0x"')
     }
 
     // Normalize: strip optional 0x prefix and lowercase so the rest of the
     // codebase can continue to compare canonical lowercase ids.
-    id = id.replace(/^0x/i, "").toLowerCase()
+    const id = rawId.replace(/^0x/i, "").toLowerCase()
 
     // Check mempool first, if present and exposing get()
     const pool = node.mempool
@@ -1073,6 +1072,17 @@ function handleRequest(
   let size = 0
   let refused = Number.isFinite(declared) && declared > MAX_RPC_BODY_BYTES
   let dead = false
+
+  if (refused) {
+    // Answer now rather than on "end": a client that announces more than it
+    // sends would otherwise wait for ever. The connection closes after it.
+    res.setHeader("Connection", "close")
+    sendJson(
+      res,
+      413,
+      errorEnvelope(null, RPC_INVALID_REQUEST, `request body exceeds ${MAX_RPC_BODY_BYTES} bytes`)
+    )
+  }
 
   req.on("data", (chunk: Buffer) => {
     if (dead) return

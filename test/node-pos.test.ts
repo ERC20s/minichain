@@ -4,6 +4,7 @@ import { blockHash, createBlock, Block } from "../src/block"
 import { canonicalBlockEncoding } from "../src/coding/serialize"
 import { Validator, proposerSeed, publicKeyToHex, selectValidator } from "../src/validators"
 import { funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -75,50 +76,56 @@ describe("Node enforces stake-weighted proposer selection", () => {
    */
   async function relay(signer: Keypair, ports: [number, number, number]) {
     const [portA, portB, portC] = ports
-    // Started downstream first: each node dials its peer once, at construction,
-    // so the listener has to exist before the dialler is built.
     // account 12 sends the transfer in the block below, so every node on the
     // path opens with it funded — an unaffordable transfer is dropped for
     // insolvency, which would hide what these tests are about
     const opening = funded([12])
     const nodeC = new Node(portC, [], genesis, [], opening)
-    await wait(60)
     const nodeB = new Node(portB, [`ws://127.0.0.1:${portC}`], genesis, validators, opening)
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
+    // Stamped at genesis, so the block sits in proposer round 0 — the round
+    // `elected` was computed for — however long the run has taken.
     const blk = createBlock(blockHash(genesis), 1, [
       signedTx(12, { recipient: "bob", amount: 1, nonce: 1 }),
-    ])
+    ], genesis.timestamp)
     const sig = signBlock(blk, signer)
 
-    await wait(120)
-    nodeA.broadcastBlock(blk, sig, signer.publicKey)
-    await wait(250)
+    try {
+      // Broadcast only once both links on the path are open, so a slow dial under
+      // a loaded test run cannot pass for "not propagated".
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
+      await waitForPeers(nodeC, { inbound: 1 }, undefined, "nodeC")
+      nodeA.broadcastBlock(blk, sig, signer.publicKey)
+      // Up to 1.5s for C to hear it: a relayed block ends the wait early, a
+      // refused one is watched for the whole window.
+      const deadline = Date.now() + 1500
+      while (nodeC.tip.height < 1 && Date.now() < deadline) await wait(25)
 
-    const tips = { b: nodeB.tip, c: nodeC.tip }
-    nodeA.close(); nodeB.close(); nodeC.close()
-    await wait(20)
-    return tips
+      return { b: nodeB.tip, c: nodeC.tip }
+    } finally {
+      await closeAll(nodeA, nodeB, nodeC)
+    }
   }
 
   it("accepts a block signed by the elected proposer and relays it", async () => {
     const tips = await relay(proposer, [9601, 9602, 9603])
     expect(tips.b.height).toBe(1)
     expect(tips.c.height).toBe(1)
-  }, 4000)
+  }, 10000)
 
   it("rejects a block signed by another staked validator and does not relay it", async () => {
     const tips = await relay(notProposer, [9611, 9612, 9613])
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 4000)
+  }, 10000)
 
   it("rejects a block signed by an unstaked key and does not relay it", async () => {
     const tips = await relay(outsider, [9621, 9622, 9623])
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 4000)
+  }, 10000)
 
   it("keeps the permissive default when no validator set is configured", async () => {
     const portA = 9631
@@ -129,13 +136,16 @@ describe("Node enforces stake-weighted proposer selection", () => {
     const blk = createBlock(blockHash(genesis), 1, [])
     const sig = signBlock(blk, outsider)
 
-    await wait(80)
-    nodeA.broadcastBlock(blk, sig, outsider.publicKey)
-    await wait(250)
+    try {
+      // A dials B before B listens, so A's link comes up on a re-dial.
+      await waitForPeers(nodeA, { inbound: 1, outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
+      nodeA.broadcastBlock(blk, sig, outsider.publicKey)
+      await waitUntil(() => nodeB.tip.height >= 1, "nodeB to accept the block at height 1")
 
-    const height = nodeB.tip.height
-    nodeA.close(); nodeB.close()
-    await wait(20)
-    expect(height).toBe(1)
-  }, 4000)
+      expect(nodeB.tip.height).toBe(1)
+    } finally {
+      await closeAll(nodeA, nodeB)
+    }
+  }, 10000)
 })

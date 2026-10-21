@@ -6,6 +6,7 @@ import { BalanceLedger } from "../src/state/balances"
 import { Mempool, transactionId } from "../src/state/mempool"
 import { NonceLedger } from "../src/state/nonces"
 import { Transaction } from "../src/types/transaction"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 /**
@@ -196,24 +197,26 @@ describe("a node pools and relays gossiped transactions", () => {
     const [portA, portB, portC] = ports
     const opening = funded([81, 82])
     const nodeC = new Node(portC, [], genesis, [], opening)
-    await wait(60)
     const nodeB = new Node(portB, [`ws://127.0.0.1:${portC}`], genesis, [], opening)
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
-    await wait(120)
+    try {
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
+      await waitForPeers(nodeC, { inbound: 1 }, undefined, "nodeC")
+    } catch (e) {
+      await closeAll(nodeA, nodeB, nodeC)
+      throw e
+    }
     return {
       a: nodeA,
       b: nodeB,
       c: nodeC,
       async sendBlock(blk: Block): Promise<void> {
         nodeA.broadcastBlock(blk, signBlock(blk, proposer), proposer.publicKey)
-        await wait(250)
+        await waitUntil(() => nodeB.tip.height >= blk.height, `nodeB to accept block ${blk.height}`)
       },
       async close() {
-        nodeA.close()
-        nodeB.close()
-        nodeC.close()
-        await wait(20)
+        await closeAll(nodeA, nodeB, nodeC)
       },
     }
   }
@@ -224,7 +227,7 @@ describe("a node pools and relays gossiped transactions", () => {
       const tx = signedTx(81, { recipient: "bob", amount: 5, nonce: 1 })
       const submitted = s.a.submitTransaction(tx)
       expect(submitted.admitted).toBe(true)
-      await wait(300)
+      await waitUntil(() => s.c.mempool.size >= 1, "the transaction to reach C's pool")
 
       expect(s.a.mempool.size).toBe(1)
       expect(s.b.mempool.size).toBe(1)
@@ -277,7 +280,7 @@ describe("a node pools and relays gossiped transactions", () => {
       const later = signedTx(81, { recipient: "bob", amount: 5, nonce: 9 })
       s.a.submitTransaction(tx)
       s.a.submitTransaction(later)
-      await wait(300)
+      await waitUntil(() => s.b.mempool.size >= 2, "both transactions to reach B's pool")
       expect(s.b.mempool.size).toBe(2)
 
       const blk = createBlock(blockHash(genesis), 1, [tx])

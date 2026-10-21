@@ -247,7 +247,7 @@ export function canonicalEncoding(tx: Transaction): Uint8Array {
       `transaction must be an object, got ${describe(tx)}`
     )
   }
-  const unknown = Object.keys(tx as Record<string, unknown>)
+  const unknown = Object.keys(tx)
     .filter((k) => !CANONICAL_TX_KNOWN_FIELD_SET.has(k))
     .sort()
   if (unknown.length > 0) {

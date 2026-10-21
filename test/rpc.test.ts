@@ -17,6 +17,7 @@ import {
   startRpcServer,
 } from "../src/rpc/server"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 /**
  * The JSON-RPC surface (src/rpc/server.ts) — its reads, its framing and its
@@ -35,10 +36,6 @@ import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
  * collide with another test file's ports; the two gossip ports it does fix,
  * 9111 and 9112, are used nowhere else in the suite.
  */
-function wait(ms: number) {
-  return new Promise((res) => setTimeout(res, ms))
-}
-
 type RpcAnswer = { status: number; body: any; text: string }
 
 /** One HTTP call against the RPC server. `body` is sent verbatim if a string. */
@@ -112,19 +109,17 @@ describe("read-only JSON-RPC server", () => {
 
   beforeAll(async () => {
     node = new Node(9112, [], genesis, validators, opening)
-    await wait(60)
     // The peer only exists to gossip a block INTO the node under test.
     peer = new Node(9111, ["ws://127.0.0.1:9112"], genesis, [], opening)
     rpc = startRpcServer(node, 0)
     port = await rpc.ready()
-    await wait(120)
+    await waitForPeers(peer, { outbound: 1 }, undefined, "peer")
+    await waitForPeers(node, { inbound: 1 }, undefined, "node")
   }, 10000)
 
   afterAll(async () => {
     await rpc.close()
-    try { peer.close() } catch (e) {}
-    try { node.close() } catch (e) {}
-    await wait(50)
+    await closeAll(peer, node)
   })
 
   it("binds a port and reports the genesis tip", async () => {
@@ -175,7 +170,7 @@ describe("read-only JSON-RPC server", () => {
       signedTx(21, { recipient: "bob", amount: 40, nonce: 7 }),
     ])
     peer.broadcastBlock(blk, signBlock(blk, proposer), proposer.publicKey)
-    await wait(250)
+    await waitUntil(() => node.tip.height >= 1, "the node to accept the gossiped block")
 
     // The node accepted it through the ordinary gossip path...
     expect(node.tip.height).toBe(1)
@@ -411,6 +406,8 @@ describe("read-only JSON-RPC server", () => {
     // or mines, and the write table holds exactly one method — which reaches the
     // mempool and nothing else. There is still no way to submit a BLOCK.
     expect(RPC_METHOD_NAMES).toEqual([
+      "chain_peers",
+      "chain_store_capacity",
       "chain_height",
       "chain_tip",
       "chain_getBalance",
@@ -418,6 +415,7 @@ describe("read-only JSON-RPC server", () => {
       "chain_mempool",
       "chain_validators",
       "chain_getBlock",
+      "chain_getBlockRange",
       "chain_getTransaction",
     ])
     expect(RPC_WRITE_METHOD_NAMES).toEqual(["chain_sendTransaction"])

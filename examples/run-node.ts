@@ -130,169 +130,175 @@ function parseIntervalMs(name: string, raw: string | undefined, fallback: number
   return value
 }
 
-const port = parsePort("PORT", process.env.PORT, 9300)
-const peers = parsePeers(process.env.PEERS)
-const validators = parseValidators(process.env.VALIDATORS)
-const openingBalances = parseGenesisBalances(process.env.GENESIS_BALANCES)
-/**
- * The JSON-RPC surface (src/rpc/server.ts). It binds loopback, so it is a way to
- * ask a node what it knows and — through chain_sendTransaction, the one write —
- * to hand it a signed transaction for its mempool. It is still never a way to
- * put a BLOCK into the node. RPC_PORT=0 disables it.
- */
-const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
-const rpcHost = (process.env.RPC_HOST && process.env.RPC_HOST.trim() !== "") ? process.env.RPC_HOST.trim() : DEFAULT_RPC_HOST
-// Opt-in to permit the chain_sendTransaction write method on non-loopback
-// binds. When set to "1" or "true" (case-insensitive), RPC_ALLOW_WRITES lets
-// operators bind RPC_HOST to 0.0.0.0 or another non-loopback interface and still
-// serve the write method. This is explicitly opt-in because the RPC has no
-// authentication and exposing write methods to a public interface is risky.
-const rpcAllowWritesNote = "Set RPC_ALLOW_WRITES=1 to permit chain_sendTransaction on non-loopback binds"
-const proposerSeedBytes = parseProposerSeed(process.env.PROPOSER_KEY)
-const proposeIntervalMs = parseIntervalMs(
-  "PROPOSE_INTERVAL_MS",
-  process.env.PROPOSE_INTERVAL_MS,
-  DEFAULT_PROPOSE_INTERVAL_MS
-)
+// Started only when this file is run (npm run dev), never when a test imports
+// the parsers above: an import must not bind ports or leave a node running.
+function main(): void {
+  const port = parsePort("PORT", process.env.PORT, 9300)
+  const peers = parsePeers(process.env.PEERS)
+  const validators = parseValidators(process.env.VALIDATORS)
+  const openingBalances = parseGenesisBalances(process.env.GENESIS_BALANCES)
+  /**
+   * The JSON-RPC surface (src/rpc/server.ts). It binds loopback, so it is a way to
+   * ask a node what it knows and — through chain_sendTransaction, the one write —
+   * to hand it a signed transaction for its mempool. It is still never a way to
+   * put a BLOCK into the node. RPC_PORT=0 disables it.
+   */
+  const rpcPort = parsePort("RPC_PORT", process.env.RPC_PORT, DEFAULT_RPC_PORT)
+  const rpcHost = (process.env.RPC_HOST && process.env.RPC_HOST.trim() !== "") ? process.env.RPC_HOST.trim() : DEFAULT_RPC_HOST
+  // Opt-in to permit the chain_sendTransaction write method on non-loopback
+  // binds. When set to "1" or "true" (case-insensitive), RPC_ALLOW_WRITES lets
+  // operators bind RPC_HOST to 0.0.0.0 or another non-loopback interface and still
+  // serve the write method. This is explicitly opt-in because the RPC has no
+  // authentication and exposing write methods to a public interface is risky.
+  const rpcAllowWritesNote = "Set RPC_ALLOW_WRITES=1 to permit chain_sendTransaction on non-loopback binds"
+  const proposerSeedBytes = parseProposerSeed(process.env.PROPOSER_KEY)
+  const proposeIntervalMs = parseIntervalMs(
+    "PROPOSE_INTERVAL_MS",
+    process.env.PROPOSE_INTERVAL_MS,
+    DEFAULT_PROPOSE_INTERVAL_MS
+  )
 
-/**
- * The chain starts from the FIXED genesis block (src/block.ts): parentHash
- * "genesis", height 0, timestamp 0, no transactions. It used to be
- * `createBlock("genesis", 0, [])`, which stamped Date.now() — so two nodes
- * started a millisecond apart held two different genesis hashes and neither
- * could ever accept the other's block 1 (acceptBlock requires
- * parentHash === blockHash(tip)). The follower simply stayed at height 0.
- * createGenesisBlock() is a pure function: the hash printed below is identical
- * in every terminal, which is how an operator can SEE that two nodes are on one
- * chain before either of them mints anything.
- */
-const genesis = createGenesisBlock()
-const node = new Node(port, peers, genesis, validators, openingBalances)
+  /**
+   * The chain starts from the FIXED genesis block (src/block.ts): parentHash
+   * "genesis", height 0, timestamp 0, no transactions. It used to be
+   * `createBlock("genesis", 0, [])`, which stamped Date.now() — so two nodes
+   * started a millisecond apart held two different genesis hashes and neither
+   * could ever accept the other's block 1 (acceptBlock requires
+   * parentHash === blockHash(tip)). The follower simply stayed at height 0.
+   * createGenesisBlock() is a pure function: the hash printed below is identical
+   * in every terminal, which is how an operator can SEE that two nodes are on one
+   * chain before either of them mints anything.
+   */
+  const genesis = createGenesisBlock()
+  const node = new Node(port, peers, genesis, validators, openingBalances)
 
-console.log(`minichain node started on port ${port}`)
-console.log(`genesis: ${blockHash(genesis)} (height 0, fixed — every node must print this same hash)`)
-if (peers.length) console.log(`peers: ${peers.join(", ")}`)
-if (validators.length) {
-  const total = validators.reduce((sum, v) => sum + v.stake, 0)
-  console.log(`validators: ${validators.length} (total stake ${total}) — proposer selection enforced`)
-} else {
-  console.log("validators: none configured — any validly signed block is accepted")
-}
-console.log(
-  `mempool: gossiped transactions are validated, pooled and relayed once ` +
-    `(up to ${MAX_MEMPOOL} pending, ${MAX_MEMPOOL_PER_SENDER} per sender)`
-)
-
-/**
- * Opening balances. Without them every account holds 0, every transfer is
- * refused "unaffordable" and this chain can never leave height 0 — so the funded
- * accounts are printed, and so is the warning that they are LOCAL: two nodes
- * given different GENESIS_BALANCES hold different ledgers and fork at the first
- * transfer, exactly as two nodes given different VALIDATORS or a different
- * genesis would.
- */
-const fundedAccounts = Object.keys(openingBalances)
-if (fundedAccounts.length) {
-  const total = fundedAccounts.reduce((sum, a) => sum + openingBalances[a], 0)
-  console.log(`opening balances: ${fundedAccounts.length} account(s), ${total} in total —`)
-  for (const account of fundedAccounts) {
-    console.log(`  ${account} = ${openingBalances[account]}`)
+  console.log(`minichain node started on port ${port}`)
+  console.log(`genesis: ${blockHash(genesis)} (height 0, fixed — every node must print this same hash)`)
+  if (peers.length) console.log(`peers: ${peers.join(", ")}`)
+  if (validators.length) {
+    const total = validators.reduce((sum, v) => sum + v.stake, 0)
+    console.log(`validators: ${validators.length} (total stake ${total}) — proposer selection enforced`)
+  } else {
+    console.log("validators: none configured — any validly signed block is accepted")
   }
   console.log(
-    "opening balances are LOCAL and unverified: every node in this network must be " +
-      "started with the same GENESIS_BALANCES, or the ledgers disagree and the chain " +
-      "forks at the first transfer"
+    `mempool: gossiped transactions are validated, pooled and relayed once ` +
+      `(up to ${MAX_MEMPOOL} pending, ${MAX_MEMPOOL_PER_SENDER} per sender)`
   )
-} else {
-  console.log(
-    "opening balances: none (GENESIS_BALANCES unset) — every account holds 0, so every " +
-      "transfer is refused as unaffordable and nothing can be minted"
-  )
-}
 
-/**
- * The JSON-RPC surface, started next to the node. Loopback-bound: it exposes the
- * tip, balances, nonces, the pending-transaction pool and the staked set, and —
- * because this bind is loopback — chain_sendTransaction, which offers a signed
- * transaction to the same mempool rules a gossiped one goes through. No method
- * on it can submit a BLOCK, so the acceptance rules in src/node.ts stay the only
- * way onto this chain.
- */
-const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, rpcHost) : null
-if (rpc) {
-  rpc
-    .ready()
-    .then((bound) => {
-      const surface = rpc.writesEnabled ? "POST, reads + chain_sendTransaction" : "POST, read-only"
-      const displayHost = typeof rpc.host === "string" && rpc.host.includes(":") ? `[${rpc.host}]` : rpc.host
-      console.log(`json-rpc listening on http://${displayHost}:${bound} (${surface})`)
-      console.log(`json-rpc methods: ${rpcMethodNames(rpc.writesEnabled).join(", ")}`)
-    })
-    .catch((err: Error) => {
-      console.warn(`json-rpc not started on port ${rpcPort}: ${err.message}`)
-    })
-} else {
-  console.log("json-rpc: disabled (RPC_PORT=0)")
-}
-
-/**
- * Block production.
- *
- * With PROPOSER_KEY set, this node tries to mint every PROPOSE_INTERVAL_MS
- * milliseconds: Node.proposeBlock takes up to MAX_BLOCK_TRANSACTIONS pending
- * transactions, refuses if this key is not the stake-elected proposer for the
- * current tip, judges its own block by the ordinary acceptance rules and only
- * then gossips it. A tick with an empty pool mints nothing — an idle chain does
- * not fill with empty blocks — so a null answer is the normal, quiet case and is
- * not logged.
- */
-const proposer = proposerSeedBytes ? keypairFromSeed(proposerSeedBytes) : null
-let proposeTimer: ReturnType<typeof setInterval> | null = null
-
-if (proposer) {
-  const hex = publicKeyToHex(proposer.publicKey)
-  console.log(
-    `proposer: enabled as ${hex} — minting every ${proposeIntervalMs}ms, ` +
-      `up to ${MAX_BLOCK_TRANSACTIONS} transactions per block`
-  )
-  if (validators.length && !validators.some((v) => v.publicKey === hex)) {
-    console.warn(
-      "proposer: this key is not in VALIDATORS — it can never be elected, so this node will mint nothing"
+  /**
+   * Opening balances. Without them every account holds 0, every transfer is
+   * refused "unaffordable" and this chain can never leave height 0 — so the funded
+   * accounts are printed, and so is the warning that they are LOCAL: two nodes
+   * given different GENESIS_BALANCES hold different ledgers and fork at the first
+   * transfer, exactly as two nodes given different VALIDATORS or a different
+   * genesis would.
+   */
+  const fundedAccounts = Object.keys(openingBalances)
+  if (fundedAccounts.length) {
+    const total = fundedAccounts.reduce((sum, a) => sum + openingBalances[a], 0)
+    console.log(`opening balances: ${fundedAccounts.length} account(s), ${total} in total —`)
+    for (const account of fundedAccounts) {
+      console.log(`  ${account} = ${openingBalances[account]}`)
+    }
+    console.log(
+      "opening balances are LOCAL and unverified: every node in this network must be " +
+        "started with the same GENESIS_BALANCES, or the ledgers disagree and the chain " +
+        "forks at the first transfer"
+    )
+  } else {
+    console.log(
+      "opening balances: none (GENESIS_BALANCES unset) — every account holds 0, so every " +
+        "transfer is refused as unaffordable and nothing can be minted"
     )
   }
-  proposeTimer = setInterval(() => {
-    try {
-      const blk = node.proposeBlock(proposer.secretKey, proposer.publicKey)
-      if (blk) {
-        console.log(
-          `minted block ${blk.height} with ${blk.transactions.length} transaction(s), ` +
-            `merkleRoot ${blk.merkleRoot.slice(0, 16)}…`
-        )
-      }
-    } catch (err) {
-      console.warn(`propose failed: ${(err as Error).message}`)
-    }
-  }, proposeIntervalMs)
-} else {
-  console.log("proposer: disabled (PROPOSER_KEY unset) — this node follows and relays, and mints nothing")
-}
 
-function shutdown() {
-  console.log("shutting down")
-  if (proposeTimer) {
-    clearInterval(proposeTimer)
-    proposeTimer = null
-  }
-  try { node.close() } catch (e) {}
+  /**
+   * The JSON-RPC surface, started next to the node. Loopback-bound: it exposes the
+   * tip, balances, nonces, the pending-transaction pool and the staked set, and —
+   * because this bind is loopback — chain_sendTransaction, which offers a signed
+   * transaction to the same mempool rules a gossiped one goes through. No method
+   * on it can submit a BLOCK, so the acceptance rules in src/node.ts stay the only
+   * way onto this chain.
+   */
+  const rpc = rpcPort > 0 ? startRpcServer(node, rpcPort, rpcHost) : null
   if (rpc) {
-    // Stop listening before the process goes, so a restart can rebind the port.
-    // The timer is a ceiling on how long shutdown may wait for that.
-    setTimeout(() => process.exit(0), 500)
-    rpc.close().then(() => process.exit(0), () => process.exit(0))
-    return
+    rpc
+      .ready()
+      .then((bound) => {
+        const surface = rpc.writesEnabled ? "POST, reads + chain_sendTransaction" : "POST, read-only"
+        const displayHost = typeof rpc.host === "string" && rpc.host.includes(":") ? `[${rpc.host}]` : rpc.host
+        console.log(`json-rpc listening on http://${displayHost}:${bound} (${surface})`)
+        console.log(`json-rpc methods: ${rpcMethodNames(rpc.writesEnabled).join(", ")}`)
+      })
+      .catch((err: Error) => {
+        console.warn(`json-rpc not started on port ${rpcPort}: ${err.message}`)
+      })
+  } else {
+    console.log("json-rpc: disabled (RPC_PORT=0)")
   }
-  process.exit(0)
+
+  /**
+   * Block production.
+   *
+   * With PROPOSER_KEY set, this node tries to mint every PROPOSE_INTERVAL_MS
+   * milliseconds: Node.proposeBlock takes up to MAX_BLOCK_TRANSACTIONS pending
+   * transactions, refuses if this key is not the stake-elected proposer for the
+   * current tip, judges its own block by the ordinary acceptance rules and only
+   * then gossips it. A tick with an empty pool mints nothing — an idle chain does
+   * not fill with empty blocks — so a null answer is the normal, quiet case and is
+   * not logged.
+   */
+  const proposer = proposerSeedBytes ? keypairFromSeed(proposerSeedBytes) : null
+  let proposeTimer: ReturnType<typeof setInterval> | null = null
+
+  if (proposer) {
+    const hex = publicKeyToHex(proposer.publicKey)
+    console.log(
+      `proposer: enabled as ${hex} — minting every ${proposeIntervalMs}ms, ` +
+        `up to ${MAX_BLOCK_TRANSACTIONS} transactions per block`
+    )
+    if (validators.length && !validators.some((v) => v.publicKey === hex)) {
+      console.warn(
+        "proposer: this key is not in VALIDATORS — it can never be elected, so this node will mint nothing"
+      )
+    }
+    proposeTimer = setInterval(() => {
+      try {
+        const blk = node.proposeBlock(proposer.secretKey, proposer.publicKey)
+        if (blk) {
+          console.log(
+            `minted block ${blk.height} with ${blk.transactions.length} transaction(s), ` +
+              `merkleRoot ${blk.merkleRoot.slice(0, 16)}…`
+          )
+        }
+      } catch (err) {
+        console.warn(`propose failed: ${(err as Error).message}`)
+      }
+    }, proposeIntervalMs)
+  } else {
+    console.log("proposer: disabled (PROPOSER_KEY unset) — this node follows and relays, and mints nothing")
+  }
+
+  function shutdown() {
+    console.log("shutting down")
+    if (proposeTimer) {
+      clearInterval(proposeTimer)
+      proposeTimer = null
+    }
+    try { node.close() } catch (e) {}
+    if (rpc) {
+      // Stop listening before the process goes, so a restart can rebind the port.
+      // The timer is a ceiling on how long shutdown may wait for that.
+      setTimeout(() => process.exit(0), 500)
+      rpc.close().then(() => process.exit(0), () => process.exit(0))
+      return
+    }
+    process.exit(0)
+  }
+
+  process.on("SIGINT", shutdown)
+  process.on("SIGTERM", shutdown)
 }
 
-process.on("SIGINT", shutdown)
-process.on("SIGTERM", shutdown)
+if (require.main === module) main()

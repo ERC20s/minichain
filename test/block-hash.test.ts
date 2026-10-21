@@ -4,6 +4,7 @@ import { canonicalBlockEncoding, CanonicalEncodingError } from "../src/coding/se
 import { keypairFromSeed, sign } from "../src/crypto/ed25519"
 import { Node } from "../src/node"
 import { signedTx } from "./helpers/signed-tx"
+import { closeAll, waitForPeers } from "./helpers/gossip"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
 
@@ -101,16 +102,19 @@ describe("a node links children by block hash, not by merkle root", () => {
     })
     const sig = sign(msg, kp.secretKey)
 
-    await wait(50)
-    nodeA.broadcastBlock(child, sig, kp.publicKey)
-    await wait(200)
+    try {
+      await waitForPeers(nodeA, { inbound: 1, outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
+      nodeA.broadcastBlock(child, sig, kp.publicKey)
+      // a window in which B must not take the child
+      await wait(200)
 
-    nodeA.close()
-    nodeB.close()
-
-    // node B's tip is the look-alike, so this child does not build on it.
-    // Under the old merkleRoot linkage it would have been accepted.
-    expect(nodeB.tip.height).toBe(0)
-    expect(nodeB.tip.timestamp).toBe(genesisB.timestamp)
-  }, 4000)
+      // node B's tip is the look-alike, so this child does not build on it.
+      // Under the old merkleRoot linkage it would have been accepted.
+      expect(nodeB.tip.height).toBe(0)
+      expect(nodeB.tip.timestamp).toBe(genesisB.timestamp)
+    } finally {
+      await closeAll(nodeA, nodeB)
+    }
+  }, 15000)
 })

@@ -5,6 +5,7 @@ import { Node } from "../src/node"
 import { NonceLedger } from "../src/state/nonces"
 import { verifyTransaction } from "../src/tx"
 import { Transaction } from "../src/types/transaction"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 import { account, accountHex, funded, signedTx } from "./helpers/signed-tx"
 
 function wait(ms: number) { return new Promise((res) => setTimeout(res, ms)) }
@@ -130,20 +131,32 @@ describe("a node drops a block that replays a transaction", () => {
     // and not on whether its transfers are affordable
     const opening = funded([74, 75])
     const nodeB = new Node(portB, [], genesis, [], opening)
-    await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
-    await wait(100)
+    try {
+      await waitForPeers(nodeA, { outbound: 1 }, undefined, "nodeA")
+      await waitForPeers(nodeB, { inbound: 1 }, undefined, "nodeB")
+    } catch (e) {
+      await closeAll(nodeA, nodeB)
+      throw e
+    }
     return {
       tip: () => nodeB.tip,
-      /** Broadcast `blk` with a genuine header signature; return B's tip. */
-      async send(blk: Block): Promise<Block> {
+      /**
+       * Broadcast `blk` with a genuine header signature; return B's tip. A block
+       * expected to land is waited for; one expected to be dropped is watched
+       * for a fixed 250 ms window.
+       */
+      async send(blk: Block, accepted: boolean): Promise<Block> {
         nodeA.broadcastBlock(blk, signBlock(blk, proposer), proposer.publicKey)
-        await wait(250)
+        if (accepted) {
+          await waitUntil(() => nodeB.tip.height >= blk.height, `nodeB to accept block ${blk.height}`)
+        } else {
+          await wait(250)
+        }
         return nodeB.tip
       },
       async close() {
-        nodeA.close(); nodeB.close()
-        await wait(20)
+        await closeAll(nodeA, nodeB)
       },
     }
   }
@@ -152,12 +165,12 @@ describe("a node drops a block that replays a transaction", () => {
     const s = await session([9941, 9942])
     try {
       const first = createBlock(blockHash(genesis), 1, [aliceOne])
-      let tip = await s.send(first)
+      let tip = await s.send(first, true)
       expect(tip.height).toBe(1)
 
       // the identical signed object, in a well-formed child of the new tip
       const replay = createBlock(blockHash(first), 2, [{ ...aliceOne }])
-      tip = await s.send(replay)
+      tip = await s.send(replay, false)
       expect(tip.height).toBe(1)
       expect(blockHash(tip)).toBe(blockHash(first))
     } finally {
@@ -169,7 +182,7 @@ describe("a node drops a block that replays a transaction", () => {
     const s = await session([9951, 9952])
     try {
       const doubled = createBlock(blockHash(genesis), 1, [aliceOne, { ...aliceOne }])
-      const tip = await s.send(doubled)
+      const tip = await s.send(doubled, false)
       expect(tip.height).toBe(0)
       expect(blockHash(tip)).toBe(blockHash(genesis))
     } finally {
@@ -181,11 +194,11 @@ describe("a node drops a block that replays a transaction", () => {
     const s = await session([9961, 9962])
     try {
       const first = createBlock(blockHash(genesis), 1, [aliceOne])
-      let tip = await s.send(first)
+      let tip = await s.send(first, true)
       expect(tip.height).toBe(1)
 
       const second = createBlock(blockHash(first), 2, [aliceTwo])
-      tip = await s.send(second)
+      tip = await s.send(second, true)
       expect(tip.height).toBe(2)
       expect(tip.transactions[0].nonce).toBe(2)
     } finally {
@@ -197,7 +210,7 @@ describe("a node drops a block that replays a transaction", () => {
     const s = await session([9971, 9972])
     try {
       const blk = createBlock(blockHash(genesis), 1, [aliceOne, carolOne])
-      const tip = await s.send(blk)
+      const tip = await s.send(blk, true)
       expect(tip.height).toBe(1)
       expect(tip.transactions.length).toBe(2)
     } finally {
@@ -209,15 +222,15 @@ describe("a node drops a block that replays a transaction", () => {
     const s = await session([9981, 9982])
     try {
       const first = createBlock(blockHash(genesis), 1, [aliceOne])
-      let tip = await s.send(first)
+      let tip = await s.send(first, true)
       expect(tip.height).toBe(1)
 
       const replay = createBlock(blockHash(first), 2, [{ ...aliceOne }])
-      tip = await s.send(replay)
+      tip = await s.send(replay, false)
       expect(tip.height).toBe(1) // dropped, and the ledger was NOT written
 
       const good = createBlock(blockHash(first), 2, [aliceTwo])
-      tip = await s.send(good)
+      tip = await s.send(good, true)
       expect(tip.height).toBe(2)
       expect(blockHash(tip)).toBe(blockHash(good))
     } finally {

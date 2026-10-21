@@ -6,6 +6,7 @@ import {
   PEER_RECONNECT_MIN_MS,
   startGossipNode,
 } from "../src/gossip/ws"
+import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
 
 /**
  * Outbound peers are re-dialled (src/gossip/ws.ts) and a reconnected link asks
@@ -30,32 +31,13 @@ import {
  *    have to wait for a future block to notice it is behind.
  *
  * Timing: the first re-dial waits PEER_RECONNECT_MIN_MS (500 ms) plus jitter,
- * so every wait below is generous rather than tight, and the delivery checks
- * re-broadcast while they poll instead of assuming one exact moment.
+ * so every wait below polls for the link itself (test/helpers/gossip.ts) with a
+ * generous deadline rather than assuming one exact moment.
  *
  * The gossip ports used below (9661-9670) are used by no other test file.
  */
 function wait(ms: number) {
   return new Promise((res) => setTimeout(res, ms))
-}
-
-/** Poll until `cond` holds, re-running `poke` each round; returns whether it did. */
-async function until(
-  cond: () => boolean,
-  timeoutMs: number,
-  poke?: () => void
-): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs
-  while (Date.now() < deadline) {
-    if (cond()) return true
-    if (poke) {
-      try {
-        poke()
-      } catch (e) {}
-    }
-    await wait(100)
-  }
-  return cond()
 }
 
 const MSG = new TextEncoder().encode("hello")
@@ -80,12 +62,13 @@ describe("gossip peers reconnect", () => {
         got++
       })
 
-      const delivered = await until(() => got > 0, 5000, () => a.broadcast("tx", MSG))
-      expect(delivered).toBe(true)
+      // the first dial failed; only a re-dial can bring this link up
+      await waitForPeers(a, { outbound: 1 }, 5000, "a")
+      a.broadcast("tx", MSG)
+      await waitUntil(() => got > 0, "b to receive a's tx")
+      expect(got).toBeGreaterThan(0)
     } finally {
-      if (b) b.close()
-      a.close()
-      await wait(20)
+      await closeAll(b, a)
     }
   }, 20000)
 
@@ -100,12 +83,17 @@ describe("gossip peers reconnect", () => {
       b1.on("tx", () => {
         first++
       })
-      expect(await until(() => first > 0, 3000, () => a.broadcast("tx", MSG))).toBe(true)
+      await waitForPeers(a, { outbound: 1 }, 3000, "a")
+      a.broadcast("tx", MSG)
+      await waitUntil(() => first > 0, "b1 to receive a's tx", 3000)
+      expect(first).toBeGreaterThan(0)
 
-      // B goes away — the socket A holds is closed under it.
-      b1.close()
+      // B goes away — the socket A holds is closed under it. Awaited, so the
+      // listening socket is gone before the port is rebound.
+      const gone = b1
       b1 = undefined
-      await wait(400) // let the listening socket actually go away before rebinding
+      await gone.close()
+      await waitUntil(() => a.peerCounts().outbound === 0, "a to see its link to b1 close")
 
       // ...and comes back on the same port, as a restarted node does.
       b2 = startGossipNode(9664, [])
@@ -113,12 +101,12 @@ describe("gossip peers reconnect", () => {
       b2.on("tx", () => {
         second++
       })
-      expect(await until(() => second > 0, 8000, () => a.broadcast("tx", MSG))).toBe(true)
+      await waitForPeers(a, { outbound: 1 }, 8000, "a")
+      a.broadcast("tx", MSG)
+      await waitUntil(() => second > 0, "b2 to receive a's tx after the restart")
+      expect(second).toBeGreaterThan(0)
     } finally {
-      if (b1) b1.close()
-      if (b2) b2.close()
-      a.close()
-      await wait(20)
+      await closeAll(b1, b2, a)
     }
   }, 30000)
 
@@ -130,19 +118,17 @@ describe("gossip peers reconnect", () => {
     let b2: ReturnType<typeof startGossipNode> | undefined
     try {
       b1 = startGossipNode(9666, [])
-      expect(await until(() => opens.length >= 1, 3000)).toBe(true)
+      await waitUntil(() => opens.length >= 1, "onPeerOpen for the first open", 3000)
       expect(opens[0]).toBe("ws://127.0.0.1:9666")
 
-      b1.close()
+      const gone = b1
       b1 = undefined
-      await wait(400)
+      await gone.close()
       b2 = startGossipNode(9666, [])
-      expect(await until(() => opens.length >= 2, 8000)).toBe(true)
+      await waitUntil(() => opens.length >= 2, "onPeerOpen for the re-open", 8000)
+      expect(opens.length).toBeGreaterThanOrEqual(2)
     } finally {
-      if (b1) b1.close()
-      if (b2) b2.close()
-      a.close()
-      await wait(20)
+      await closeAll(b1, b2, a)
     }
   }, 30000)
 
@@ -152,8 +138,7 @@ describe("gossip peers reconnect", () => {
     let late: WebSocketServer | undefined
     try {
       await wait(900) // at least one re-dial has been scheduled and fired
-      a.close()
-      await wait(100)
+      await a.close()
 
       // A server started AFTER close() must never see a connection: if the
       // backoff timers were still running, one would land here.
@@ -171,7 +156,6 @@ describe("gossip peers reconnect", () => {
       if (late) {
         await new Promise((res) => late!.close(() => res(null)))
       }
-      await wait(20)
     }
   }, 20000)
 
@@ -182,8 +166,6 @@ describe("gossip peers reconnect", () => {
     let a: Node | undefined = new Node(9669, [], genesis, [])
     let b: Node | undefined
     try {
-      await wait(100)
-
       b = new Node(9670, ["ws://127.0.0.1:9669"], genesis, [], undefined, {
         syncRequestIntervalMs: 0, // no rate limit in this test
       })
@@ -197,18 +179,19 @@ describe("gossip peers reconnect", () => {
 
       // First open: the node asks at once instead of waiting for a block it
       // cannot use to tell it that it is behind.
-      expect(await until(() => sent.filter((t) => t === "req").length >= 1, 3000)).toBe(true)
+      await waitUntil(() => sent.filter((t) => t === "req").length >= 1, "b's first catch-up req", 3000)
+      expect(sent.filter((t) => t === "req").length).toBeGreaterThanOrEqual(1)
 
       // The peer restarts; the link is re-dialled and the node asks again.
-      a.close()
+      // Awaited, so the listening socket is gone before the port is rebound.
+      const gone = a
       a = undefined
-      await wait(400) // let the listening socket go away before rebinding the port
+      await gone.close()
       a = new Node(9669, [], genesis, [])
-      expect(await until(() => sent.filter((t) => t === "req").length >= 2, 8000)).toBe(true)
+      await waitUntil(() => sent.filter((t) => t === "req").length >= 2, "b's req after the re-dial", 8000)
+      expect(sent.filter((t) => t === "req").length).toBeGreaterThanOrEqual(2)
     } finally {
-      if (b) b.close()
-      if (a) a.close()
-      await wait(20)
+      await closeAll(b, a)
     }
   }, 30000)
 })
