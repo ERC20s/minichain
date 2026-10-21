@@ -88,3 +88,81 @@ export function merkleRoot(transactions: Uint8Array[] | string[]): string {
 
   return Buffer.from(layer[0]).toString("hex")
 }
+
+/**
+ * One step of a Merkle proof: the sibling hash and which SIDE of the running
+ * hash it sits on. "left" means the sibling is the left child
+ * (node = sha256(0x01 || sibling || running)); "right" means it is the right
+ * child (node = sha256(0x01 || running || sibling)).
+ */
+export interface MerkleProofStep {
+  sibling: Uint8Array
+  side: "left" | "right"
+}
+
+/**
+ * The hashes needed to recompute the root from the transaction at `index`.
+ *
+ * Built with exactly the layering merkleRoot() uses, so the two cannot drift: a
+ * layer of odd width PROMOTES its last node, and a promoted node contributes NO
+ * step (it is carried up unchanged), which is why proofs for one tree can have
+ * different lengths. Throws a RangeError for an index outside the list.
+ */
+export function merkleProof(transactions: Uint8Array[] | string[], index: number): MerkleProofStep[] {
+  const list = transactions || []
+  if (!Number.isInteger(index) || index < 0 || index >= list.length) {
+    throw new RangeError(`merkleProof: index ${String(index)} is outside a list of ${list.length}`)
+  }
+  let layer: Uint8Array[] = (list as (Uint8Array | string)[]).map((t) => merkleLeafHash(t))
+  let at = index
+  const proof: MerkleProofStep[] = []
+
+  while (layer.length > 1) {
+    const next: Uint8Array[] = []
+    for (let i = 0; i < layer.length; i += 2) {
+      if (i + 1 >= layer.length) {
+        next.push(layer[i])
+        break
+      }
+      next.push(merkleNodeHash(layer[i], layer[i + 1]))
+    }
+    const isPromoted = layer.length % 2 === 1 && at === layer.length - 1
+    if (!isPromoted) {
+      const siblingAt = at % 2 === 0 ? at + 1 : at - 1
+      proof.push({ sibling: layer[siblingAt], side: at % 2 === 0 ? "right" : "left" })
+    }
+    at = Math.floor(at / 2)
+    layer = next
+  }
+  return proof
+}
+
+/**
+ * Does `proof` carry `tx` up to `root`?
+ *
+ * The running value starts as the TAGGED leaf hash of `tx` and every step
+ * applies the TAGGED node hash, so a verifier never hashes untagged bytes: an
+ * internal node's value presented as a "transaction" hashes under 0x00 and
+ * cannot stand in for a 0x01 node, and a proof cannot be shortened or extended
+ * past its tree (an extra or missing step changes the value). Answers false —
+ * never throws — for a malformed proof, so a caller cannot accept on error.
+ */
+export function verifyMerkleProof(
+  root: string,
+  tx: Uint8Array | string,
+  proof: MerkleProofStep[]
+): boolean {
+  try {
+    if (typeof root !== "string" || !Array.isArray(proof)) return false
+    let running = merkleLeafHash(tx)
+    for (const step of proof) {
+      if (!step || !(step.sibling instanceof Uint8Array) || step.sibling.length !== 32) return false
+      if (step.side === "left") running = merkleNodeHash(step.sibling, running)
+      else if (step.side === "right") running = merkleNodeHash(running, step.sibling)
+      else return false
+    }
+    return Buffer.from(running).toString("hex") === root
+  } catch (e) {
+    return false
+  }
+}

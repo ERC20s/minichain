@@ -1,5 +1,5 @@
 import WebSocket from "ws"
-import { startGossipNode, MAX_ENVELOPE_CHARS } from "../src/gossip/ws"
+import { startGossipNode, MAX_ENVELOPE_BYTES, MAX_ENVELOPE_CHARS } from "../src/gossip/ws"
 import { keypairFromSeed, sign, verify } from "../src/crypto/ed25519"
 import { canonicalEncoding } from "../src/coding/serialize"
 import { closeAll, waitForPeers, waitUntil } from "./helpers/gossip"
@@ -130,7 +130,15 @@ describe("gossip websocket transport", () => {
     }
   }, 15000)
 
-  it("drops a frame that is too large to be an envelope without parsing it, and keeps serving", async () => {
+  it("refuses a frame too large to be an envelope at the socket, and keeps serving", async () => {
+    // This test used to expect the SAME socket to carry a normal frame after a
+    // 1 MiB one: the transport buffered the whole frame (ws's default
+    // maxPayload is 100 MiB) and then dropped it by length. The real bound is
+    // now ws's maxPayload = MAX_ENVELOPE_BYTES, so an oversized frame is cut
+    // off mid-read and the offending socket is closed with 1009 ("message too
+    // big") — nothing is buffered, nothing is parsed, nothing is delivered —
+    // and the node goes on serving every other socket, including a fresh one
+    // from the same peer.
     const portA = 9723
     const portB = 9724
     const urlA = `ws://127.0.0.1:${portA}`
@@ -144,34 +152,40 @@ describe("gossip websocket transport", () => {
       delivered.push(new TextDecoder().decode(m.payload))
     })
 
-    let ws: WebSocket | undefined
+    let first: WebSocket | undefined
+    let second: WebSocket | undefined
     try {
       await waitForPeers(nodeA, { inbound: 1, outbound: 1 }, undefined, "nodeA")
       await waitForPeers(nodeB, { inbound: 1, outbound: 1 }, undefined, "nodeB")
 
       const sock = new WebSocket(urlA)
-      ws = sock
+      first = sock
+      const closedWith = new Promise<number>((res) => sock.on("close", (code) => res(code)))
       await new Promise((res) => sock.on("open", res))
 
-      // 1 MiB of JSON: far past any envelope this transport can accept, so the
-      // size guard must reject it before JSON.parse allocates the object graph.
+      // 1 MiB of JSON: far past any envelope this transport can accept.
       const huge = JSON.stringify({ type: "tx", payloadHex: "a".repeat(1024 * 1024) })
       expect(huge.length).toBeGreaterThan(MAX_ENVELOPE_CHARS)
+      expect(huge.length).toBeGreaterThan(MAX_ENVELOPE_BYTES)
       const started = Date.now()
       sock.send(huge)
-      // a window in which the oversized frame must not be delivered
-      await wait(150)
+
+      // the socket that sent it is closed by the server: 1009, message too big
+      expect(await closedWith).toBe(1009)
       expect(delivered.length).toBe(0)
 
-      // the same connection still carries a normal message afterwards
+      // a fresh connection from the same peer is served as normal
+      const again = new WebSocket(urlA)
+      second = again
+      await new Promise((res) => again.on("open", res))
       const good = JSON.stringify({ type: "tx", payloadHex: "abcd" })
-      sock.send(good)
+      again.send(good)
       await waitUntil(() => delivered.length >= 1, "nodeA to deliver the normal frame")
 
       expect(delivered.length).toBe(1)
       expect(Date.now() - started).toBeLessThan(2000)
     } finally {
-      await closeAll(ws && closableSocket(ws), nodeA, nodeB)
+      await closeAll(first && closableSocket(first), second && closableSocket(second), nodeA, nodeB)
     }
   }, 15000)
 

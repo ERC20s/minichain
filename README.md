@@ -96,7 +96,10 @@ would elect a different proposer.
 The trade-off: if round 0's winner is merely slow rather than absent, two valid
 blocks can appear at one height. There is still no fork choice — a proposer only
 ever extends the tip it holds, and a node keeps the first valid block it saw at
-a height — so the slot is kept wide to keep that window small.
+a height — so the slot is kept wide to keep that window small. The rule as it
+stands, and what it does and does not decide between competing blocks, is
+written down in `SPEC.md` under "Fork choice and proposer eligibility, as
+implemented".
 
 ## Catching up
 
@@ -240,5 +243,8 @@ Errors use the standard codes: `-32700` parse error, `-32600` invalid request,
 
     npm test
 
-`SPEC.md` records the canonical encodings, the block acceptance rules and this
-RPC surface.
+`SPEC.md` records the canonical encodings, the block acceptance rules (and
+their order), the fork-choice rule as implemented, the gossip input bounds and
+this RPC surface. The `test/property-*.test.ts` files are property-based
+(fast-check): encode/decode round trips, Merkle proofs verifying exactly for
+members, and signatures verifying exactly for the signing key.
