@@ -1,8 +1,8 @@
-import { startGossipNode, GossipNode } from "./gossip/ws"
+import { startGossipNode, GossipNode, GossipOptions } from "./gossip/ws"
 import { Block, blockHash, createBlock, transactionLeaves } from "./block"
 import { merkleRoot } from "./merkle"
 import { canonicalBlockEncoding, CanonicalBlockHeader } from "./coding/serialize"
-import { sign, verify } from "./crypto/ed25519"
+import { ED25519_PUBLIC_KEY_BYTES, ED25519_SIGNATURE_BYTES, sign, verify } from "./crypto/ed25519"
 import { BalanceLedger, OpeningBalances } from "./state/balances"
 import { ChainStore, DEFAULT_CHAIN_STORE_CAPACITY } from "./state/chain"
 import { Mempool, MempoolOptions, MempoolResult } from "./state/mempool"
@@ -106,6 +106,8 @@ export interface NodeOptions {
    * second. Must be a non-negative safe integer.
    */
   syncRequestIntervalMs?: number
+  /** Overrides the gossip transport's input bounds (see src/gossip/ws.ts). */
+  gossip?: GossipOptions
 }
 
 export class Node {
@@ -166,7 +168,7 @@ export class Node {
     openingBalances?: OpeningBalances,
     options?: NodeOptions
   ) {
-    this.gossip = startGossipNode(port, peers)
+    this.gossip = startGossipNode(port, peers, options && options.gossip)
     this.tip = genesis
     const drift = options && options.maxFutureDriftMs
     this.maxFutureDriftMs =
@@ -483,6 +485,31 @@ export class Node {
    * block off the wire — a self-minted block that fails our own rules is never
    * broadcast, and there is no local shortcut into the chain.
    *
+   * The ORDER is part of the design (SPEC.md, "Block acceptance order"):
+   *
+   *   1. linkage        height = tip + 1, parentHash = blockHash(tip)
+   *   2. timestamp      safe integer, not behind the parent, not past the drift
+   *   3. header seal    a 32-byte key and a canonical 64-byte signature that
+   *                     verify over the canonical header
+   *   4. eligibility    that key is the validator elected for this tip and the
+   *                     block's round (when a set is configured)
+   *   5. commitment     the Merkle root recomputes from the transactions
+   *   6. authorisation  every transaction signature verifies
+   *   7. freshness      every nonce rises (replay protection)
+   *   8. solvency       every sender can pay
+   *   9. state          tip, nonces, balances, store and pool move together
+   *
+   * Cheap and identity-establishing checks come first: everything up to step 4
+   * costs one hash and one signature verification and tells us WHO sent the
+   * block and whether they were entitled to. Only a block from the entitled
+   * proposer reaches the per-transaction work (up to MAX_BLOCK_TRANSACTIONS
+   * signature verifications), so an unelected key or a stranger cannot make
+   * this node verify 256 signatures per frame. Steps 5-8 are content checks on
+   * an authenticated block and stage against the ledgers without writing;
+   * step 9 is the only write, and it happens only when every earlier step has
+   * passed. The outcome is identical in any order — a block fails or passes
+   * as a whole — so the order is about cost, never about which blocks pass.
+   *
    * Returns true only when the tip moved. It never throws and it never
    * broadcasts: relaying is the caller's business, precisely because a caller
    * that has the original bytes should relay those bytes.
@@ -491,7 +518,7 @@ export class Node {
     try {
       if (!blk || typeof blk !== "object") return false
 
-      // basic linkage: must be exactly tip.height + 1
+      // 1. linkage: must be exactly tip.height + 1
       if (typeof blk.height !== "number" || blk.height !== this.tip.height + 1) return false
       // and must name THIS tip by its block hash. The tip's merkleRoot commits
       // only to its transactions, so it linked a child equally well to any
@@ -499,7 +526,7 @@ export class Node {
       // one root); the header hash is unique to the block.
       if (typeof blk.parentHash !== "string" || blk.parentHash !== blockHash(this.tip)) return false
 
-      // timestamp bounds.
+      // 2. timestamp bounds.
       //
       // Every other header field was checked and this one was only copied
       // into the header the signature is verified over, so a proposer could
@@ -510,8 +537,7 @@ export class Node {
       // in the year 3000, or before its own parent, makes the chain's own
       // ordering meaningless.
       //
-      // Three cheap checks, run before the Merkle recompute and the
-      // signature work: the stamp must be a real (non-negative, safe)
+      // Three cheap checks: the stamp must be a real (non-negative, safe)
       // integer, it must not go BACKWARDS from the tip (equal is allowed —
       // blocks minted in the same millisecond are ordinary), and it must not
       // be further ahead of this node's clock than maxFutureDriftMs. A
@@ -525,77 +551,17 @@ export class Node {
       }
       if (blk.timestamp > this.now() + this.maxFutureDriftMs) return false
 
-      // recompute merkle root from transactions.
+      // 3. header seal: WHO proposed this block.
       //
-      // The leaves are the CANONICAL transaction encoding, the same bytes a
-      // transaction signature is made over — not JSON.stringify, which
-      // preserves key order (one transaction, two roots) and turns NaN and
-      // Infinity into null (a block committing to amount: NaN recomputed to
-      // the same root on every node and was accepted). canonicalEncoding
-      // throws on anything it cannot represent, so a block carrying an
-      // unencodable transaction is DROPPED here: the tip does not move and
-      // nothing is re-broadcast.
-      const txs = (blk.transactions || []) as Transaction[]
-      let txBytes: Uint8Array[]
-      try {
-        txBytes = transactionLeaves(txs)
-      } catch (e) {
-        return false
-      }
-      const mr = merkleRoot(txBytes)
-      if (mr !== blk.merkleRoot) return false
-
-      // per-transaction authorisation.
-      //
-      // The root above proves the block commits to exactly these transactions
-      // and the header signature below proves WHO proposed the block — neither
-      // says the sender agreed to be debited. Without this check an elected
-      // proposer could mint {sender: "alice", recipient: "me", amount: 1e6}
-      // and every node would accept and relay it. Each transaction must carry
-      // an ed25519 signature that verifies against the public key its own
-      // `sender` field names; one failure drops the whole block, so the tip
-      // does not move and nothing is re-broadcast.
-      for (const tx of txs) {
-        if (!verifyTransaction(tx)) return false
-      }
-
-      // replay protection.
-      //
-      // A signature proves the sender consented to THESE bytes; it never
-      // expires, so the identical signed object verifies for ever. Without the
-      // check below a proposer could put an already-accepted transaction into
-      // the next block, or the same one twice into this one, and every check
-      // above still passed — same leaves, same root, same header signature,
-      // same elected proposer — so the transfer happened again.
-      //
-      // Each sender's nonce must be STRICTLY greater than the last one this
-      // node accepted for it, counting transactions earlier in the same block.
-      // Staging touches no state: the ledger is written only at the accept
-      // point below, so a block dropped by the header-signature or proposer
-      // check cannot burn nonces the chain never spent.
-      const staged = this.nonces.stage(txs)
-      if (staged === null) return false
-
-      // solvency.
-      //
-      // The checks above prove the block commits to these transactions, that
-      // each sender consented to its own, and that none of them is a replay.
-      // None of them proves the money exists: an elected proposer could sign a
-      // fresh, correctly nonced transfer of 1e15 from an account that has
-      // never been credited and every check so far still passed, so the tip
-      // moved and the node relayed value created out of nothing.
-      //
-      // Each sender's running balance — genesis mints plus whatever it has
-      // received, minus what it has spent, counting transactions earlier in
-      // this same block — must cover the amount. One overdraft drops the WHOLE
-      // block. Staging touches no state; the ledger is written only at the
-      // accept point below, so a block dropped by the header-signature or
-      // proposer check cannot spend balances the chain never spent.
-      const stagedBalances = this.balances.stage(txs)
-      if (stagedBalances === null) return false
-
-      // require signature and pubKey
-      if (!sig || !pubKey) return false
+      // A raw 32-byte key and a 64-byte signature, verified over the canonical
+      // header (which commits to the merkleRoot the block claims, so the
+      // recompute below is checking a signed claim, not a loose field). Sizes
+      // are pinned here so a stranger's 512-byte "signature" is refused by a
+      // length comparison, and verify() refuses a non-canonical S, so every
+      // valid seal has one byte encoding.
+      if (!(sig instanceof Uint8Array) || !(pubKey instanceof Uint8Array)) return false
+      if (sig.length !== ED25519_SIGNATURE_BYTES || pubKey.length !== ED25519_PUBLIC_KEY_BYTES) return false
+      if (typeof blk.merkleRoot !== "string") return false
 
       const header: CanonicalBlockHeader = {
         parentHash: blk.parentHash,
@@ -608,7 +574,7 @@ export class Node {
       const ok = verify(msg, sig, pubKey)
       if (!ok) return false
 
-      // proof of stake: a valid signature only proves WHO signed the block,
+      // 4. eligibility: a valid signature only proves WHO signed the block,
       // not that they were entitled to propose it. When this node is
       // configured with a validator set, the signer must be the validator the
       // stake-weighted selector elects for this height — the seed being the
@@ -634,7 +600,74 @@ export class Node {
         if (elected.toLowerCase() !== publicKeyToHex(pubKey)) return false
       }
 
-      // accept block: the tip moves and the nonces and balances this block
+      // 5. commitment: recompute the Merkle root from the transactions.
+      //
+      // The leaves are the CANONICAL transaction encoding, the same bytes a
+      // transaction signature is made over — not JSON.stringify, which
+      // preserves key order (one transaction, two roots) and turns NaN and
+      // Infinity into null (a block committing to amount: NaN recomputed to
+      // the same root on every node and was accepted). canonicalEncoding
+      // throws on anything it cannot represent, so a block carrying an
+      // unencodable transaction is DROPPED here: the tip does not move and
+      // nothing is re-broadcast.
+      const txs = (blk.transactions || []) as Transaction[]
+      let txBytes: Uint8Array[]
+      try {
+        txBytes = transactionLeaves(txs)
+      } catch (e) {
+        return false
+      }
+      const mr = merkleRoot(txBytes)
+      if (mr !== blk.merkleRoot) return false
+
+      // 6. authorisation: per-transaction signatures.
+      //
+      // The root above proves the block commits to exactly these transactions
+      // and the header seal proved WHO proposed the block — neither says the
+      // sender agreed to be debited. Without this check an elected proposer
+      // could mint {sender: "alice", recipient: "me", amount: 1e6} and every
+      // node would accept and relay it. Each transaction must carry an
+      // ed25519 signature that verifies against the public key its own
+      // `sender` field names; one failure drops the whole block, so the tip
+      // does not move and nothing is re-broadcast.
+      for (const tx of txs) {
+        if (!verifyTransaction(tx)) return false
+      }
+
+      // 7. freshness: replay protection.
+      //
+      // A signature proves the sender consented to THESE bytes; it never
+      // expires, so the identical signed object verifies for ever. Without the
+      // check below a proposer could put an already-accepted transaction into
+      // the next block, or the same one twice into this one, and every check
+      // above still passed — same leaves, same root, same header signature,
+      // same elected proposer — so the transfer happened again.
+      //
+      // Each sender's nonce must be STRICTLY greater than the last one this
+      // node accepted for it, counting transactions earlier in the same block.
+      // Staging touches no state: the ledger is written only at the accept
+      // point below.
+      const staged = this.nonces.stage(txs)
+      if (staged === null) return false
+
+      // 8. solvency.
+      //
+      // The checks above prove the block commits to these transactions, that
+      // each sender consented to its own, and that none of them is a replay.
+      // None of them proves the money exists: an elected proposer could sign a
+      // fresh, correctly nonced transfer of 1e15 from an account that has
+      // never been credited and every check so far still passed, so the tip
+      // moved and the node relayed value created out of nothing.
+      //
+      // Each sender's running balance — genesis mints plus whatever it has
+      // received, minus what it has spent, counting transactions earlier in
+      // this same block — must cover the amount. One overdraft drops the WHOLE
+      // block. Staging touches no state; the ledger is written only at the
+      // accept point below.
+      const stagedBalances = this.balances.stage(txs)
+      if (stagedBalances === null) return false
+
+      // 9. accept block: the tip moves and the nonces and balances this block
       // spent are written together, so the three can never disagree.
       this.tip = blk
       this.nonces.commit(staged)

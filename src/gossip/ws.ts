@@ -91,6 +91,66 @@ export const PEER_RECONNECT_MAX_MS = 15000
 /** Up to this fraction of the delay is added at random, so peers spread out. */
 export const PEER_RECONNECT_JITTER = 0.25
 
+/**
+ * How many INBOUND sockets one node accepts at once. A connection past the cap
+ * is closed with 1013 ("try again later") before it can send a frame, so a
+ * stranger cannot open sockets until the process runs out of descriptors. The
+ * outbound side is already bounded by the PEERS list.
+ */
+export const MAX_INBOUND_PEERS = 64
+
+/**
+ * Per-socket inbound frame budget: a token bucket of MAX_FRAME_BURST frames
+ * refilled at MAX_FRAMES_PER_SECOND. A frame that finds the bucket empty is
+ * dropped — the socket stays up, so an honest peer that is merely busy loses a
+ * frame it can ask for again (a block, through a "req"), while a peer that
+ * floods costs this node one subtraction per frame instead of a JSON parse, a
+ * hex decode and a signature check. The burst is wider than the largest honest
+ * one: a catch-up answer is at most MAX_SYNC_BLOCKS (32) frames back to back.
+ */
+export const MAX_FRAME_BURST = 256
+export const MAX_FRAMES_PER_SECOND = 128
+
+/** Optional transport knobs, so a test can tighten a bound without waiting on it. */
+export interface GossipOptions {
+  /** Overrides MAX_INBOUND_PEERS. Must be a positive safe integer. */
+  maxInboundPeers?: number
+  /** Overrides MAX_FRAME_BURST. Must be a positive safe integer. */
+  maxFrameBurst?: number
+  /** Overrides MAX_FRAMES_PER_SECOND. Must be a positive finite number. */
+  maxFramesPerSecond?: number
+}
+
+function positiveInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : fallback
+}
+
+function positiveNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
+}
+
+/** A token bucket: `tokens` frames may pass now; one more every 1000/rate ms. */
+class FrameBudget {
+  private tokens: number
+  private last: number
+  constructor(private readonly burst: number, private readonly perSecond: number) {
+    this.tokens = burst
+    this.last = Date.now()
+  }
+  /** Spend one token if there is one. */
+  take(): boolean {
+    const now = Date.now()
+    const elapsed = now - this.last
+    if (elapsed > 0) {
+      this.tokens = Math.min(this.burst, this.tokens + (elapsed * this.perSecond) / 1000)
+      this.last = now
+    }
+    if (this.tokens < 1) return false
+    this.tokens -= 1
+    return true
+  }
+}
+
 // defensive limits
 const ALLOWED_TYPES = new Set(["tx", "blk", "req"])
 const MAX_PAYLOAD_HEX = 131072 // max chars in hex (64 KiB bytes)
@@ -111,7 +171,14 @@ export const MAX_ENVELOPE_CHARS =
 // BMP character is one unit; a 4-byte character is two units), so a frame over
 // this many BYTES cannot decode to a string within MAX_ENVELOPE_CHARS. Checking
 // it first lets us drop a huge binary frame without even building the string.
-const MAX_ENVELOPE_BYTES = MAX_ENVELOPE_CHARS * 3
+//
+// It is also handed to ws as `maxPayload`, on the server and on every outbound
+// socket. Without that the library's default (100 MiB) applied, so a peer could
+// make this node BUFFER a hundred megabytes per frame before the length check
+// here ever ran. Past maxPayload, ws aborts the read and closes that socket
+// with 1009 ("message too big"); an honest peer never sends such a frame, since
+// its own encoder is bounded by the same maxima.
+export const MAX_ENVELOPE_BYTES = MAX_ENVELOPE_CHARS * 3
 
 function validHexString(s: any, maxLen: number): s is string {
   if (typeof s !== "string") return false
@@ -142,10 +209,16 @@ function incomingByteLength(data: any): number | undefined {
   return undefined
 }
 
-export function startGossipNode(port: number, peers: string[]): GossipNode {
-  const server = new WebSocketServer({ port })
+export function startGossipNode(port: number, peers: string[], options?: GossipOptions): GossipNode {
+  const maxInboundPeers = positiveInteger(options && options.maxInboundPeers, MAX_INBOUND_PEERS)
+  const maxFrameBurst = positiveInteger(options && options.maxFrameBurst, MAX_FRAME_BURST)
+  const maxFramesPerSecond = positiveNumber(options && options.maxFramesPerSecond, MAX_FRAMES_PER_SECOND)
+
+  const server = new WebSocketServer({ port, maxPayload: MAX_ENVELOPE_BYTES })
   const sockets: Set<WebSocket> = new Set()
   const listeners: Map<string, ((msg: any) => void)[]> = new Map()
+  /** One frame budget per live socket, inbound or outbound. */
+  const budgets: WeakMap<WebSocket, FrameBudget> = new WeakMap()
 
   function emit(type: string, obj: any) {
     const cbs = listeners.get(type) || []
@@ -183,7 +256,16 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
   // peer alone. It is optional so the guards below keep working unchanged.
   function handleIncomingMessage(data: WebSocket.Data, from?: WebSocket) {
     try {
-      // Size first: a peer that sends megabytes of JSON should cost us a
+      // Rate first: a peer over its frame budget costs one subtraction.
+      if (from) {
+        let budget = budgets.get(from)
+        if (!budget) {
+          budget = new FrameBudget(maxFrameBurst, maxFramesPerSecond)
+          budgets.set(from, budget)
+        }
+        if (!budget.take()) return
+      }
+      // Size next: a peer that sends megabytes of JSON should cost us a
       // length comparison, not a parse and the allocations behind it.
       const bytes = incomingByteLength(data)
       if (bytes !== undefined && bytes > MAX_ENVELOPE_BYTES) return
@@ -211,6 +293,13 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
   }
 
   server.on("connection", (ws: WebSocket) => {
+    if (sockets.size >= maxInboundPeers) {
+      // Over the cap: refused before a single frame is read. 1013 is the
+      // standard "try again later", which an honest peer's re-dial will.
+      ws.on("error", () => {})
+      try { ws.close(1013, "too many peers") } catch (e) {}
+      return
+    }
     sockets.add(ws)
     ws.on("message", (data: WebSocket.Data) => {
       handleIncomingMessage(data, ws)
@@ -266,7 +355,7 @@ export function startGossipNode(port: number, peers: string[]): GossipNode {
 
     let dialled: WebSocket | undefined
     try {
-      dialled = new WebSocket(url)
+      dialled = new WebSocket(url, { maxPayload: MAX_ENVELOPE_BYTES })
     } catch (e) {
       // A URL the ws constructor throws on (a bad scheme, say) is retried like
       // any other failure rather than dropped for the lifetime of the node.

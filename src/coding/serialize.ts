@@ -69,11 +69,40 @@ export function assertUint64(n: unknown, field: string): number {
   return n
 }
 
-/** Assert that `s` is a string (a missing field must never encode as "undefined"). */
+/**
+ * A UTF-16 code unit that is not part of a surrogate pair: a high surrogate
+ * with no low surrogate after it, or a low surrogate with no high one before.
+ */
+const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
+
+/** Is `s` well-formed Unicode: no lone surrogate code units? */
+export function isWellFormedString(s: string): boolean {
+  return !LONE_SURROGATE.test(s)
+}
+
+/**
+ * Assert that `s` is a WELL-FORMED string: a missing field must never encode as
+ * "undefined", and a lone surrogate must never encode at all.
+ *
+ * The second rule is an injectivity rule. The encoder writes UTF-8, and the
+ * WHATWG TextEncoder replaces every lone surrogate with U+FFFD, so the two
+ * JavaScript strings "\uD800bob" and "\uFFFDbob" — distinct values, both of
+ * which JSON carries faithfully across the wire — produced the SAME bytes. A
+ * signature over one verified for the other, the Merkle leaf was the same, and
+ * so a relay could rewrite the recipient of a signed transfer in flight to a
+ * different account key and every rule still passed. Rejecting ill-formed
+ * strings gives each encodable string exactly one encoding and each encoding
+ * exactly one string.
+ */
 export function assertString(s: unknown, field: string): string {
   if (typeof s !== "string") {
     throw new CanonicalEncodingError(
       `${field} must be a string, got ${describe(s)}`
+    )
+  }
+  if (!isWellFormedString(s)) {
+    throw new CanonicalEncodingError(
+      `${field} contains a lone surrogate; only well-formed Unicode can be encoded`
     )
   }
   return s
@@ -173,6 +202,12 @@ function stringifyAt(value: unknown, path: string): string {
     }
     return JSON.stringify(value)
   }
+  if (t === "string") {
+    // JSON.stringify escapes a lone surrogate as \udXXX, which is injective
+    // as text, but a payload that cannot survive a UTF-8 round trip has no
+    // place in a signed preimage: one rule for every string in a transaction.
+    return JSON.stringify(assertString(value, path))
+  }
   if (value === null || t !== "object") return JSON.stringify(value)
   if (Array.isArray(value)) {
     return (
@@ -185,7 +220,10 @@ function stringifyAt(value: unknown, path: string): string {
     "{" +
     keys
       .map(
-        (k) => JSON.stringify(k) + ":" + stringifyAt(record[k], `${path}.${k}`)
+        (k) =>
+          JSON.stringify(assertString(k, `${path} key`)) +
+          ":" +
+          stringifyAt(record[k], `${path}.${k}`)
       )
       .join(",") +
     "}"
@@ -316,4 +354,152 @@ export function canonicalBlockEncoding(header: CanonicalBlockHeader): Uint8Array
   }
 
   return concat(parts)
+}
+
+/*
+ * Decoders.
+ *
+ * The encodings above are SIGNING preimages: nothing on the wire carries them
+ * (blocks and transactions travel as JSON) and nothing has to parse them to run
+ * a node. The decoders exist to make injectivity TESTABLE as a round trip —
+ * decode(encode(x)) must give back x, and encode(decode(bytes)) must give back
+ * bytes — and they are as strict as the encoders: a prefix that is not the
+ * domain tag, a field that runs past the end, a number above 2**53 - 1, a
+ * string that is not valid UTF-8, a payload whose JSON is not already in the
+ * sorted canonical form, or a single trailing byte all throw a
+ * CanonicalEncodingError. A second encoding of one value is a decoder failure,
+ * never a tolerated spelling.
+ */
+
+/** Reads length-prefixed fields and fixed-width integers off a byte string. */
+class CanonicalReader {
+  private off = 0
+  constructor(private readonly bytes: Uint8Array, private readonly what: string) {
+    if (!(bytes instanceof Uint8Array)) {
+      throw new CanonicalEncodingError(`${what} must be a Uint8Array, got ${describe(bytes)}`)
+    }
+  }
+
+  private need(n: number, field: string): void {
+    if (this.off + n > this.bytes.length) {
+      throw new CanonicalEncodingError(
+        `${this.what} ends inside ${field}: needs ${n} more byte(s) at offset ${this.off}`
+      )
+    }
+  }
+
+  prefix(tag: string): void {
+    const expected = utf8Bytes(tag)
+    this.need(expected.length, "the domain tag")
+    for (let i = 0; i < expected.length; i++) {
+      if (this.bytes[this.off + i] !== expected[i]) {
+        throw new CanonicalEncodingError(`${this.what} does not start with ${JSON.stringify(tag)}`)
+      }
+    }
+    this.off += expected.length
+  }
+
+  u16(field: string): number {
+    this.need(2, field)
+    const n = (this.bytes[this.off] << 8) | this.bytes[this.off + 1]
+    this.off += 2
+    return n
+  }
+
+  u64(field: string): number {
+    this.need(8, field)
+    let hi = 0
+    let lo = 0
+    for (let i = 0; i < 4; i++) hi = hi * 256 + this.bytes[this.off + i]
+    for (let i = 4; i < 8; i++) lo = lo * 256 + this.bytes[this.off + i]
+    this.off += 8
+    const n = hi * 2 ** 32 + lo
+    // 2**53 - 1 is the largest value u64be can have written, so anything above
+    // it is not an encoding this format produces.
+    if (n > MAX_CANONICAL_UINT) {
+      throw new CanonicalEncodingError(`${field} is above ${MAX_CANONICAL_UINT} (2**53 - 1)`)
+    }
+    return n
+  }
+
+  bytes16(field: string): Uint8Array {
+    const len = this.u16(field)
+    this.need(len, field)
+    const out = this.bytes.slice(this.off, this.off + len)
+    this.off += len
+    return out
+  }
+
+  string16(field: string): string {
+    const raw = this.bytes16(field)
+    let text: string
+    try {
+      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(raw)
+    } catch (e) {
+      throw new CanonicalEncodingError(`${field} is not valid UTF-8`)
+    }
+    // Decoded text is always well-formed, but the encoder refuses a lone
+    // surrogate, so this is the same rule read back: the bytes an encoder
+    // could not have written are not an encoding.
+    return assertString(text, field)
+  }
+
+  end(): void {
+    if (this.off !== this.bytes.length) {
+      throw new CanonicalEncodingError(
+        `${this.what} has ${this.bytes.length - this.off} trailing byte(s) after the last field`
+      )
+    }
+  }
+}
+
+/** A transaction read back from canonicalEncoding(): the five signed fields, no signature. */
+export type DecodedTransaction = Pick<Transaction, "sender" | "recipient" | "amount" | "nonce" | "payload">
+
+/**
+ * Inverse of canonicalEncoding() over its range. `payload` is absent when the
+ * encoded payload length is zero (the encoder writes a zero length for an
+ * undefined payload and never for a defined one, because JSON text is never
+ * empty). A payload whose JSON text is not the sorted canonical form
+ * stableStringify would produce is refused.
+ */
+export function decodeCanonicalEncoding(bytes: Uint8Array): DecodedTransaction {
+  const r = new CanonicalReader(bytes, "transaction encoding")
+  r.prefix("tx:")
+  const sender = r.string16("tx.sender")
+  const recipient = r.string16("tx.recipient")
+  const amount = r.u64("tx.amount")
+  const nonce = r.u64("tx.nonce")
+  const payloadText = r.string16("tx.payload")
+  r.end()
+  if (payloadText.length === 0) return { sender, recipient, amount, nonce }
+  let payload: unknown
+  try {
+    payload = JSON.parse(payloadText)
+  } catch (e) {
+    throw new CanonicalEncodingError("tx.payload is not JSON")
+  }
+  if (stableStringify(payload, "tx.payload") !== payloadText) {
+    throw new CanonicalEncodingError("tx.payload is JSON but not in canonical (sorted-key) form")
+  }
+  return { sender, recipient, amount, nonce, payload }
+}
+
+/**
+ * Inverse of canonicalBlockEncoding() over its range. `proposerPublicKey` is
+ * absent when the encoded key length is zero, which is how a Block's own hash
+ * preimage is written (src/block.ts).
+ */
+export function decodeCanonicalBlockEncoding(bytes: Uint8Array): CanonicalBlockHeader {
+  const r = new CanonicalReader(bytes, "block header encoding")
+  r.prefix("blk:")
+  const parentHash = r.string16("header.parentHash")
+  const height = r.u64("header.height")
+  const timestamp = r.u64("header.timestamp")
+  const merkleRoot = r.string16("header.merkleRoot")
+  const proposerPublicKey = r.bytes16("header.proposerPublicKey")
+  r.end()
+  const header: CanonicalBlockHeader = { parentHash, height, timestamp, merkleRoot }
+  if (proposerPublicKey.length > 0) header.proposerPublicKey = proposerPublicKey
+  return header
 }
