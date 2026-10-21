@@ -86,7 +86,14 @@ describe("Node bounds block timestamps", () => {
     const sig = signBlock(blk, proposer)
     blk.timestamp = timestamp
 
-    await wait(120)
+    // Broadcast only once both links on the path are open, so a slow dial under
+    // a loaded test run cannot pass for "not propagated".
+    for (let i = 0; i < 40; i++) {
+      if (nodeA.peerCounts().outbound > 0 && nodeB.peerCounts().outbound > 0) break
+      await wait(50)
+    }
+    expect(nodeA.peerCounts().outbound).toBe(1)
+    expect(nodeB.peerCounts().outbound).toBe(1)
     nodeA.broadcastBlock(blk, sig, proposer.publicKey)
     await wait(250)
 

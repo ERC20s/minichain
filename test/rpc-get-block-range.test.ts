@@ -83,9 +83,9 @@ describe("chain_getBlockRange RPC", () => {
   let port = 0
 
   beforeAll(async () => {
-    node = new Node(9112, [], genesis, validators, opening)
+    node = new Node(9212, [], genesis, validators, opening)
     await wait(60)
-    peer = new Node(9111, ["ws://127.0.0.1:9112"], genesis, [], opening)
+    peer = new Node(9211, ["ws://127.0.0.1:9212"], genesis, [], opening)
     rpc = startRpcServer(node, 0)
     port = await rpc.ready()
     await wait(120)

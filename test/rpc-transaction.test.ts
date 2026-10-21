@@ -79,9 +79,9 @@ describe("chain_getTransaction RPC", () => {
   let rpcHandle: any
 
   beforeAll(async () => {
-    node = new Node(9122, [], genesis, validators, opening)
+    node = new Node(9216, [], genesis, validators, opening)
     await wait(60)
-    peer = new Node(9121, ["ws://127.0.0.1:9122"], genesis, [], opening)
+    peer = new Node(9215, ["ws://127.0.0.1:9216"], genesis, [], opening)
     rpcHandle = startRpcServer(node, 0)
     rpcPort = await rpcHandle.ready()
     await wait(120)

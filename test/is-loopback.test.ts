@@ -18,8 +18,18 @@ describe("isLoopbackHost", () => {
     expect(isLoopbackHost("::ffff:127.0.0.1")).toBe(true)
     expect(isLoopbackHost("::ffff:127.0.0.2")).toBe(true)
     expect(isLoopbackHost("[::ffff:127.0.0.2]")).toBe(true)
-    // 32-bit hex representation of 127.0.0.1 is 7f000001
-    expect(isLoopbackHost("::ffff:7f000001")).toBe(true)
+    // hex-group representation of 127.0.0.1 is 7f00:1 (what URL parsing yields)
+    expect(isLoopbackHost("::ffff:7f00:1")).toBe(true)
+    expect(isLoopbackHost("[::ffff:7f00:1]")).toBe(true)
+    expect(isLoopbackHost("::ffff:7fff:ffff")).toBe(true)
+  })
+
+  it("rejects IPv4-mapped addresses outside 127.0.0.0/8 and malformed hex forms", () => {
+    expect(isLoopbackHost("::ffff:a00:1")).toBe(false) // 10.0.0.1
+    expect(isLoopbackHost("::ffff:8000:1")).toBe(false) // 128.0.0.1
+    expect(isLoopbackHost("::ffff:10.0.0.1")).toBe(false)
+    // not a valid IPv6 literal: a group holds at most four hex digits
+    expect(isLoopbackHost("::ffff:7f000001")).toBe(false)
   })
 
   it("rejects malformed IPv4 and non-loopback addresses", () => {

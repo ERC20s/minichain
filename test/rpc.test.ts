@@ -411,6 +411,8 @@ describe("read-only JSON-RPC server", () => {
     // or mines, and the write table holds exactly one method — which reaches the
     // mempool and nothing else. There is still no way to submit a BLOCK.
     expect(RPC_METHOD_NAMES).toEqual([
+      "chain_peers",
+      "chain_store_capacity",
       "chain_height",
       "chain_tip",
       "chain_getBalance",
@@ -418,6 +420,7 @@ describe("read-only JSON-RPC server", () => {
       "chain_mempool",
       "chain_validators",
       "chain_getBlock",
+      "chain_getBlockRange",
       "chain_getTransaction",
     ])
     expect(RPC_WRITE_METHOD_NAMES).toEqual(["chain_sendTransaction"])

@@ -104,20 +104,26 @@ describe("two nodes built from their OWN genesis share one chain", () => {
 
   it("accepts a minted block over real gossip", async () => {
     // Each node builds its own genesis object, as two separate processes do.
+    // Both clocks are pinned: genesis is stamped 0, so the proposer round of
+    // height 1 is derived from "now", and a wall clock crossing a slot boundary
+    // mid-test would elect someone else.
+    const clock = Date.now()
     const genesisB = createGenesisBlock()
-    const nodeB = new Node(9191, [], genesisB, validators, opening)
+    const nodeB = new Node(9191, [], genesisB, validators, opening, { now: () => clock })
     await wait(60)
     const genesisA = createGenesisBlock()
-    const nodeA = new Node(9192, ["ws://127.0.0.1:9191"], genesisA, validators, opening)
+    const nodeA = new Node(9192, ["ws://127.0.0.1:9191"], genesisA, validators, opening, { now: () => clock })
     await wait(120)
 
     try {
       // The two nodes never shared an object, yet they must hold one tip.
       expect(blockHash(nodeA.tip)).toBe(blockHash(nodeB.tip))
 
-      // Who may propose height 1 is fixed by that shared tip.
-      const elected = selectValidator(validators, proposerSeed(genesisA))
-      expect(elected).toBe(selectValidator(validators, proposerSeed(genesisB)))
+      // Who may propose height 1 is fixed by that shared tip and the round.
+      const round = nodeA.proposerRound(clock)
+      expect(nodeB.proposerRound(clock)).toBe(round)
+      const elected = selectValidator(validators, proposerSeed(genesisA, round))
+      expect(elected).toBe(selectValidator(validators, proposerSeed(genesisB, round)))
       const proposer = publicKeyToHex(alice.publicKey) === elected ? alice : bob
 
       const tx = signedTx(81, { recipient: "carol", amount: 9, nonce: 1 })

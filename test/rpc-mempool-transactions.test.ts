@@ -81,9 +81,9 @@ describe("chain_mempool includeTransactions", () => {
   let rpc: any
 
   beforeAll(async () => {
-    node = new Node(9112, [], genesis, validators, opening)
+    node = new Node(9214, [], genesis, validators, opening)
     await wait(60)
-    peer = new Node(9111, ["ws://127.0.0.1:9112"], genesis, [], opening)
+    peer = new Node(9213, ["ws://127.0.0.1:9214"], genesis, [], opening)
     rpc = startRpcServer(node, 0)
     rpcPort = await rpc.ready()
     await wait(120)

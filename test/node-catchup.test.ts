@@ -90,18 +90,20 @@ describe("a node catches up over gossip", () => {
       expect(a.chain.get(3)!.pubKey).toEqual(proposer.publicKey)
 
       // B joins now, at genesis, three blocks behind. Same genesis, same opening
-      // balances — createGenesisBlock is deterministic.
+      // balances — createGenesisBlock is deterministic. B asks for the gap from
+      // height 1 the moment its link to A opens (see "Reconnecting peers" in
+      // the README), and A answers 1, 2 and 3 to B alone — nothing new minted.
       b = new Node(9252, ["ws://127.0.0.1:9251"], genesis, [], opening)
-      await wait(250)
-      expect(b.tip.height).toBe(0)
+      for (let i = 0; i < 30 && b.tip.height < 3; i++) await wait(100)
+      expect(b.tip.height).toBe(3)
+      expect(blockHash(b.tip)).toBe(blockHash(a.tip))
 
-      // A mints a fourth block. B cannot use it (height 4, tip 0), asks for the
-      // gap from height 1, and A answers 1, 2, 3 and 4 to B alone.
+      // A mints a fourth block, and B follows it as an ordinary gossiped block.
       expect(
         a.submitTransaction(signedTx(81, { recipient: "carol", amount: 1, nonce: 4 })).admitted
       ).toBe(true)
       expect(a.proposeBlock(proposer.secretKey, proposer.publicKey)).not.toBeNull()
-      await wait(700)
+      for (let i = 0; i < 30 && b.tip.height < 4; i++) await wait(100)
 
       expect(b.tip.height).toBe(4)
       expect(blockHash(b.tip)).toBe(blockHash(a.tip))
