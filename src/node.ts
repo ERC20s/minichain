@@ -504,7 +504,11 @@ export class Node {
    * block and whether they were entitled to. Only a block from the entitled
    * proposer reaches the per-transaction work (up to MAX_BLOCK_TRANSACTIONS
    * signature verifications), so an unelected key or a stranger cannot make
-   * this node verify 256 signatures per frame. Steps 5-8 are content checks on
+   * this node verify 256 signatures per frame — when a validator set is
+   * configured. With none (VALIDATORS unset) step 4 is skipped and any key's
+   * valid seal reaches step 5; the open set has no entitled proposer to gate
+   * on, so the per-frame cost there is bounded only by the gossip frame
+   * budget (src/gossip/ws.ts). Steps 5-8 are content checks on
    * an authenticated block and stage against the ledgers without writing;
    * step 9 is the only write, and it happens only when every earlier step has
    * passed. The outcome is identical in any order — a block fails or passes

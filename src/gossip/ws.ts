@@ -1,3 +1,4 @@
+import { performance } from "perf_hooks"
 import WebSocket, { Server as WebSocketServer } from "ws"
 
 function hex(u: Uint8Array): string {
@@ -129,17 +130,24 @@ function positiveNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback
 }
 
-/** A token bucket: `tokens` frames may pass now; one more every 1000/rate ms. */
+/**
+ * A token bucket: `tokens` frames may pass now; one more every 1000/rate ms.
+ *
+ * Timed on the MONOTONIC clock. On Date.now() a wall clock stepped backwards
+ * (NTP, a manual change) left `elapsed` negative until the clock caught up
+ * again, so an emptied bucket did not refill and every frame from that peer
+ * was dropped for as long as the step.
+ */
 class FrameBudget {
   private tokens: number
   private last: number
   constructor(private readonly burst: number, private readonly perSecond: number) {
     this.tokens = burst
-    this.last = Date.now()
+    this.last = performance.now()
   }
   /** Spend one token if there is one. */
   take(): boolean {
-    const now = Date.now()
+    const now = performance.now()
     const elapsed = now - this.last
     if (elapsed > 0) {
       this.tokens = Math.min(this.burst, this.tokens + (elapsed * this.perSecond) / 1000)
@@ -368,6 +376,8 @@ export function startGossipNode(port: number, peers: string[], options?: GossipO
     const c = dialled
     peerSockets.add(c)
 
+    // The attempt this dial was made at, so a refusal can keep escalating.
+    const dialAttempt = attempt
     c.on("open", () => {
       if (closed) {
         try { c.close() } catch (e) {}
@@ -387,9 +397,13 @@ export function startGossipNode(port: number, peers: string[], options?: GossipO
     c.on("message", (data: WebSocket.Data) => {
       handleIncomingMessage(data, c)
     })
-    c.on("close", () => {
+    c.on("close", (code: number) => {
       clients.delete(c)
       peerSockets.delete(c)
+      // 1013 is a full peer refusing us (MAX_INBOUND_PEERS) right after the
+      // open: not a link that was up, so the backoff keeps growing rather than
+      // restarting at the minimum and re-dialling the full node twice a second.
+      if (code === 1013) attempt = dialAttempt
       scheduleRetry()
     })
     c.on("error", () => {
