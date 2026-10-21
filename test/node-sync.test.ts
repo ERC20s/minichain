@@ -44,19 +44,27 @@ describe("in-memory Node syncing over gossip", () => {
     const msg = canonicalBlockEncoding(header as any)
     const sig = sign(msg, kp.secretKey)
 
-    // give servers a moment to start
-    await wait(50)
+    try {
+      // Broadcast only once both links are open. A dials B before B listens, so
+      // A's link comes up on a re-dial, after the backoff, not at once.
+      for (let i = 0; i < 60; i++) {
+        if (nodeA.peerCounts().outbound > 0 && nodeB.peerCounts().outbound > 0) break
+        await wait(50)
+      }
+      expect(nodeA.peerCounts().outbound).toBe(1)
+      expect(nodeB.peerCounts().outbound).toBe(1)
 
-    nodeA.broadcastBlock(blk, sig, kp.publicKey)
+      nodeA.broadcastBlock(blk, sig, kp.publicKey)
 
-    await wait(200)
+      // B accepts the block and relays it, which is how A's own tip moves.
+      for (let i = 0; i < 60 && (nodeA.tip.height < 1 || nodeB.tip.height < 1); i++) await wait(50)
 
-    // close nodes
-    nodeA.close()
-    nodeB.close()
-
-    expect(nodeA.tip.height).toBe(1)
-    expect(nodeB.tip.height).toBe(1)
-    expect(nodeA.tip.merkleRoot).toEqual(nodeB.tip.merkleRoot)
-  }, 2000)
+      expect(nodeA.tip.height).toBe(1)
+      expect(nodeB.tip.height).toBe(1)
+      expect(nodeA.tip.merkleRoot).toEqual(nodeB.tip.merkleRoot)
+    } finally {
+      nodeA.close()
+      nodeB.close()
+    }
+  }, 10000)
 })

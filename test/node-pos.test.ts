@@ -87,38 +87,51 @@ describe("Node enforces stake-weighted proposer selection", () => {
     await wait(60)
     const nodeA = new Node(portA, [`ws://127.0.0.1:${portB}`], genesis, [], opening)
 
+    // Stamped at genesis, so the block sits in proposer round 0 — the round
+    // `elected` was computed for — however long the run has taken.
     const blk = createBlock(blockHash(genesis), 1, [
       signedTx(12, { recipient: "bob", amount: 1, nonce: 1 }),
-    ])
+    ], genesis.timestamp)
     const sig = signBlock(blk, signer)
 
-    await wait(120)
-    nodeA.broadcastBlock(blk, sig, signer.publicKey)
-    await wait(250)
+    try {
+      // Broadcast only once both links on the path are open, so a slow dial under
+      // a loaded test run cannot pass for "not propagated".
+      for (let i = 0; i < 40; i++) {
+        if (nodeA.peerCounts().outbound > 0 && nodeB.peerCounts().outbound > 0) break
+        await wait(50)
+      }
+      expect(nodeA.peerCounts().outbound).toBe(1)
+      expect(nodeB.peerCounts().outbound).toBe(1)
+      nodeA.broadcastBlock(blk, sig, signer.publicKey)
+      // Up to 1.5s for C to hear it: a relayed block ends the wait early, a
+      // refused one is watched for the whole window.
+      for (let i = 0; i < 30 && nodeC.tip.height < 1; i++) await wait(50)
 
-    const tips = { b: nodeB.tip, c: nodeC.tip }
-    nodeA.close(); nodeB.close(); nodeC.close()
-    await wait(20)
-    return tips
+      return { b: nodeB.tip, c: nodeC.tip }
+    } finally {
+      nodeA.close(); nodeB.close(); nodeC.close()
+      await wait(20)
+    }
   }
 
   it("accepts a block signed by the elected proposer and relays it", async () => {
     const tips = await relay(proposer, [9601, 9602, 9603])
     expect(tips.b.height).toBe(1)
     expect(tips.c.height).toBe(1)
-  }, 4000)
+  }, 10000)
 
   it("rejects a block signed by another staked validator and does not relay it", async () => {
     const tips = await relay(notProposer, [9611, 9612, 9613])
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 4000)
+  }, 10000)
 
   it("rejects a block signed by an unstaked key and does not relay it", async () => {
     const tips = await relay(outsider, [9621, 9622, 9623])
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 4000)
+  }, 10000)
 
   it("keeps the permissive default when no validator set is configured", async () => {
     const portA = 9631
@@ -129,13 +142,17 @@ describe("Node enforces stake-weighted proposer selection", () => {
     const blk = createBlock(blockHash(genesis), 1, [])
     const sig = signBlock(blk, outsider)
 
-    await wait(80)
-    nodeA.broadcastBlock(blk, sig, outsider.publicKey)
-    await wait(250)
+    try {
+      // A dials B before B listens, so A's link comes up on a re-dial.
+      for (let i = 0; i < 60 && nodeA.peerCounts().outbound < 1; i++) await wait(50)
+      expect(nodeA.peerCounts().outbound).toBe(1)
+      nodeA.broadcastBlock(blk, sig, outsider.publicKey)
+      for (let i = 0; i < 60 && nodeB.tip.height < 1; i++) await wait(50)
 
-    const height = nodeB.tip.height
-    nodeA.close(); nodeB.close()
-    await wait(20)
-    expect(height).toBe(1)
-  }, 4000)
+      expect(nodeB.tip.height).toBe(1)
+    } finally {
+      nodeA.close(); nodeB.close()
+      await wait(20)
+    }
+  }, 10000)
 })

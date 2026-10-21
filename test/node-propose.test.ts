@@ -57,6 +57,10 @@ describe("Node.proposeBlock mints from its own mempool", () => {
   ]
 
   const genesis = createBlock("0x00", 0, [])
+  // Every node's clock is pinned to genesis, so each block here sits in proposer
+  // round 0 however long the run takes: on a real clock, a test reached more
+  // than PROPOSER_SLOT_MS after this file loaded would elect another validator.
+  const clock = { now: () => genesis.timestamp }
 
   // Who may propose height 1 is fixed by the tip: seed = "pos:" || blockHash(genesis).
   const elected = selectValidator(validators, proposerSeed(genesis))
@@ -68,7 +72,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
   const opening = funded([81, 82])
 
   it("mints a block carrying pooled transactions, moves the tip and drains the pool", async () => {
-    const node = new Node(9171, [], genesis, validators, opening)
+    const node = new Node(9171, [], genesis, validators, opening, clock)
     try {
       const first = signedTx(81, { recipient: "carol", amount: 5, nonce: 1 })
       const second = signedTx(81, { recipient: "carol", amount: 7, nonce: 2 })
@@ -102,7 +106,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
   }, 8000)
 
   it("mints nothing from a key that is not elected for this tip", async () => {
-    const node = new Node(9172, [], genesis, validators, opening)
+    const node = new Node(9172, [], genesis, validators, opening, clock)
     try {
       const tx = signedTx(81, { recipient: "carol", amount: 5, nonce: 1 })
       expect(node.submitTransaction(tx).admitted).toBe(true)
@@ -123,7 +127,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
   }, 8000)
 
   it("mints nothing from an empty pool unless allowEmpty is asked for", async () => {
-    const node = new Node(9173, [], genesis, validators, opening)
+    const node = new Node(9173, [], genesis, validators, opening, clock)
     try {
       expect(node.mempool.size).toBe(0)
       expect(node.proposeBlock(proposer.secretKey, proposer.publicKey)).toBeNull()
@@ -140,7 +144,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
   }, 8000)
 
   it("carries at most maxTransactions, and never more than the pool holds", async () => {
-    const node = new Node(9174, [], genesis, validators, opening)
+    const node = new Node(9174, [], genesis, validators, opening, clock)
     try {
       node.submitTransaction(signedTx(81, { recipient: "carol", amount: 1, nonce: 1 }))
       node.submitTransaction(signedTx(81, { recipient: "carol", amount: 1, nonce: 2 }))
@@ -178,7 +182,7 @@ describe("Node.proposeBlock mints from its own mempool", () => {
   }, 8000)
 
   it("never broadcasts a block its own rules refuse", async () => {
-    const node = new Node(9176, [], genesis, validators, opening)
+    const node = new Node(9176, [], genesis, validators, opening, clock)
     try {
       node.submitTransaction(signedTx(81, { recipient: "carol", amount: 1, nonce: 1 }))
       // A signature made with the WRONG secret key: elected public key, bytes
@@ -204,19 +208,21 @@ describe("Node.proposeBlock mints from its own mempool", () => {
 
   it("gossips a minted block, and a second node accepts it", async () => {
     // B is started first: each node dials its peer once, at construction.
-    const nodeB = new Node(9183, [], genesis, validators, opening)
+    const nodeB = new Node(9183, [], genesis, validators, opening, clock)
     await wait(60)
-    const nodeA = new Node(9182, [`ws://127.0.0.1:9183`], genesis, validators, opening)
-    await wait(120)
+    const nodeA = new Node(9182, [`ws://127.0.0.1:9183`], genesis, validators, opening, clock)
     try {
+      for (let i = 0; i < 40 && nodeA.peerCounts().outbound < 1; i++) await wait(50)
+      expect(nodeA.peerCounts().outbound).toBe(1)
+
       const tx = signedTx(81, { recipient: "carol", amount: 9, nonce: 1 })
       expect(nodeA.submitTransaction(tx).admitted).toBe(true)
-      await wait(200)
+      for (let i = 0; i < 40 && nodeB.mempool.size < 1; i++) await wait(50)
       expect(nodeB.mempool.size).toBe(1)
 
       const minted = nodeA.proposeBlock(proposer.secretKey, proposer.publicKey)
       expect(minted).not.toBeNull()
-      await wait(300)
+      for (let i = 0; i < 40 && nodeB.tip.height < 1; i++) await wait(50)
 
       expect(nodeB.tip.height).toBe(1)
       expect(blockHash(nodeB.tip)).toBe(blockHash(minted!))
@@ -267,6 +273,10 @@ describe("Node.proposeBlock skips a pending transaction that cannot stage", () =
   ]
 
   const genesis = createBlock("0x00", 0, [])
+  // Every node's clock is pinned to genesis, so each block here sits in proposer
+  // round 0 however long the run takes: on a real clock, a test reached more
+  // than PROPOSER_SLOT_MS after this file loaded would elect another validator.
+  const clock = { now: () => genesis.timestamp }
 
   /** Whoever the stake election names for this tip. */
   const electedFor = (tip: Block): Keypair =>
@@ -287,8 +297,7 @@ describe("Node.proposeBlock skips a pending transaction that cannot stage", () =
     expect(node.submitTransaction(pending).admitted).toBe(true)
 
     const spent = signedTx(83, { recipient: rich, amount: 100, nonce: 1 })
-    const stamp = Math.max(genesis.timestamp, Date.now())
-    const blk = createBlock(blockHash(genesis), 1, [spent], stamp)
+    const blk = createBlock(blockHash(genesis), 1, [spent], genesis.timestamp)
     const proposer = electedFor(genesis)
     expect(node.acceptBlock(blk, signBlock(blk, proposer), proposer.publicKey)).toBe(true)
 
@@ -303,7 +312,7 @@ describe("Node.proposeBlock skips a pending transaction that cannot stage", () =
   }
 
   it("mints past a pending transfer its sender can no longer afford", async () => {
-    const node = new Node(9177, [], genesis, validators, opening)
+    const node = new Node(9177, [], genesis, validators, opening, clock)
     try {
       const stuck = poison(node)
 
@@ -339,7 +348,7 @@ describe("Node.proposeBlock skips a pending transaction that cannot stage", () =
   }, 8000)
 
   it("includes a skipped entry in the same block that credits its sender", async () => {
-    const node = new Node(9178, [], genesis, validators, opening)
+    const node = new Node(9178, [], genesis, validators, opening, clock)
     try {
       const stuck = poison(node)
 

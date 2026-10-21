@@ -86,59 +86,63 @@ describe("Node bounds block timestamps", () => {
     const sig = signBlock(blk, proposer)
     blk.timestamp = timestamp
 
-    // Broadcast only once both links on the path are open, so a slow dial under
-    // a loaded test run cannot pass for "not propagated".
-    for (let i = 0; i < 40; i++) {
-      if (nodeA.peerCounts().outbound > 0 && nodeB.peerCounts().outbound > 0) break
-      await wait(50)
-    }
-    expect(nodeA.peerCounts().outbound).toBe(1)
-    expect(nodeB.peerCounts().outbound).toBe(1)
-    nodeA.broadcastBlock(blk, sig, proposer.publicKey)
-    await wait(250)
+    try {
+      // Broadcast only once both links on the path are open, so a slow dial under
+      // a loaded test run cannot pass for "not propagated".
+      for (let i = 0; i < 40; i++) {
+        if (nodeA.peerCounts().outbound > 0 && nodeB.peerCounts().outbound > 0) break
+        await wait(50)
+      }
+      expect(nodeA.peerCounts().outbound).toBe(1)
+      expect(nodeB.peerCounts().outbound).toBe(1)
+      nodeA.broadcastBlock(blk, sig, proposer.publicKey)
+      // Up to 1.5s for C to hear it: a relayed block ends the wait early, a
+      // dropped one is watched for the whole window.
+      for (let i = 0; i < 30 && nodeC.tip.height < 1; i++) await wait(50)
 
-    const tips = { b: nodeB.tip, c: nodeC.tip }
-    nodeA.close(); nodeB.close(); nodeC.close()
-    await wait(20)
-    return tips
+      return { b: nodeB.tip, c: nodeC.tip }
+    } finally {
+      nodeA.close(); nodeB.close(); nodeC.close()
+      await wait(20)
+    }
   }
 
   it("accepts a block stamped exactly at its parent's time", async () => {
     const tips = await relay(BASE, [9011, 9012, 9013])
     expect(tips.b.height).toBe(1)
     expect(tips.c.height).toBe(1)
-  }, 5000)
+  }, 10000)
 
   it("accepts a block stamped slightly ahead of the node's clock", async () => {
     const tips = await relay(BASE + 30000, [9021, 9022, 9023])
     expect(tips.b.height).toBe(1)
     expect(tips.c.height).toBe(1)
-  }, 5000)
+  }, 10000)
 
   it("drops a block stamped before its parent and does not relay it", async () => {
     const tips = await relay(BASE - 1000, [9031, 9032, 9033])
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 5000)
+  }, 10000)
 
   it("drops a far-future block and does not relay it", async () => {
     const tips = await relay(BASE + 10 * 60 * 1000, [9041, 9042, 9043])
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 5000)
+  }, 10000)
 
   it("honours a tighter configured drift", async () => {
     // 5 seconds ahead: inside the 120s default, outside this node's 1s bound.
     const tips = await relay(BASE + 5000, [9051, 9052, 9053], { maxFutureDriftMs: 1000 })
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 5000)
+  }, 10000)
 
   it("drops a block whose timestamp is not a usable integer", async () => {
     const tips = await relay(BASE + 0.5, [9061, 9062, 9063], undefined, BASE)
     expect(tips.b.height).toBe(0)
     expect(tips.c.height).toBe(0)
-  }, 5000)
+  }, 10000)
 
   it("keeps the default drift when the option is missing or unusable", () => {
     const node = new Node(9071, [], genesis, [], undefined, { maxFutureDriftMs: -1 })
